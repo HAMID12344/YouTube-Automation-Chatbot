@@ -203,6 +203,7 @@ def initialize_session_state():
         "chunk_count": 0,
         "processed_identifier": "",       # video_id or sha256
         "processed_cache": {},            # identifier -> cached pipeline dict
+        "current_provider": "Hugging Face",
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -271,21 +272,35 @@ def is_hf_permission_error(exc: Exception) -> bool:
 class LocalGGUFLLM:
     """Lightweight in-process GGUF LLM wrapper using llama_cpp for reliable local inference."""
     def __init__(self, model_path: str):
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Local GGUF model not found at path: {model_path}")
         from llama_cpp import Llama
-        self.llm = Llama(model_path=model_path, n_ctx=2048, verbose=False)
+        self.model_path = model_path
+        # 4096 context window supports complete retrieved chunks and conversational context
+        self.llm = Llama(model_path=model_path, n_ctx=4096, verbose=False)
 
     def invoke(self, prompt: str) -> str:
+        few_shot_system = """You are a video question-answering assistant.
+Answer the user's question using ONLY the supplied video transcript context.
+If the user asks for the main points, summary, overview, or what the video is about, summarize the key events, people, and topics discussed in the transcript.
+
+Do not use outside knowledge. Do not guess. Do not invent facts.
+
+CRITICAL RULE: If the question is about outside topics, general trivia, or anything NOT in the transcript, you MUST respond EXACTLY:
+I couldn't find the answer to that in the video.
+
+Example 1:
+Context: The speaker explains how to train a dog using treats and positive reinforcement.
+Question: What is the capital of Spain?
+Answer: I couldn't find the answer to that in the video.
+
+Example 2:
+Context: The speaker explains how to train a dog using treats and positive reinforcement.
+Question: What method is used to train the dog?
+Answer: The dog is trained using treats and positive reinforcement."""
         res = self.llm.create_chat_completion(
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a helpful and strictly factual AI video assistant. "
-                        "Answer questions ONLY from the provided video context. "
-                        "If the answer is not present in the context, you MUST respond exactly: "
-                        "'I couldn't find the answer to that in the video.'"
-                    )
-                },
+                {"role": "system", "content": few_shot_system},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=256,
@@ -295,35 +310,29 @@ class LocalGGUFLLM:
 
 @st.cache_resource(show_spinner=False)
 def get_fallback_llm():
-    if LOCAL_MODEL_PATH and os.path.exists(LOCAL_MODEL_PATH):
-        try:
-            return LocalGGUFLLM(LOCAL_MODEL_PATH)
-        except Exception:
-            pass
-
-    return HuggingFacePipeline.from_model_id(
-        model_id=HF_LOCAL_MODEL_ID,
-        task="text-generation",
-        pipeline_kwargs={"max_new_tokens": 128, "do_sample": False},
-    )
+    if not LOCAL_MODEL_PATH or not os.path.exists(LOCAL_MODEL_PATH):
+        err_msg = f"Local AI model is not configured. Expected GGUF model file not found at: '{LOCAL_MODEL_PATH}'"
+        print(f"[LLM] ERROR: {err_msg}")
+        raise FileNotFoundError(err_msg)
+    try:
+        print(f"[LLM] Initializing local GGUF model from: {LOCAL_MODEL_PATH}")
+        return LocalGGUFLLM(LOCAL_MODEL_PATH)
+    except Exception as e:
+        print(f"[LLM] Failed to load local GGUF model: {e}")
+        raise RuntimeError(f"Failed to load local GGUF model from {LOCAL_MODEL_PATH}: {e}") from e
 
 @st.cache_resource(show_spinner=False)
 def get_llm():
     require_hf_token()
-    try:
-        llm = HuggingFaceEndpoint(
-            repo_id=HF_MODEL_ID,
-            task="text-generation",
-            huggingfacehub_api_token=HF_TOKEN,
-            max_new_tokens=512,
-            temperature=0.1,
-            top_p=0.9,
-        )
-        return ChatHuggingFace(llm=llm)
-    except Exception as exc:
-        if not is_hf_permission_error(exc):
-            raise
-        return get_fallback_llm()
+    llm = HuggingFaceEndpoint(
+        repo_id=HF_MODEL_ID,
+        task="text-generation",
+        huggingfacehub_api_token=HF_TOKEN,
+        max_new_tokens=512,
+        temperature=0.1,
+        top_p=0.9,
+    )
+    return ChatHuggingFace(llm=llm)
 
 # ============================================================
 # AUDIO EXTRACTION
@@ -552,28 +561,66 @@ ANSWER:
 """
     return PromptTemplate(template=template, input_variables=["context", "question"])
 
-def generate_answer(context: str, question: str) -> str:
+def generate_answer(context: str, question: str, docs: Optional[List[Any]] = None) -> str:
+    """
+    Generates a grounded answer using Hugging Face Cloud inference when available,
+    falling back automatically to the local GGUF model on ANY cloud failure.
+    """
     if not context or not context.strip():
         return "I couldn't find the answer to that in the video."
 
     prompt = create_prompt()
     formatted_prompt = prompt.format(context=context, question=question)
 
-    try:
-        llm = get_llm()
-        response = llm.invoke(formatted_prompt)
-    except Exception as exc:
-        if not is_hf_permission_error(exc):
-            raise
-        llm = get_fallback_llm()
-        response = llm.invoke(formatted_prompt)
+    answer_raw = None
+    force_local = os.getenv("FORCE_LOCAL_LLM", "").strip().lower() in ("1", "true", "yes")
 
-    if hasattr(response, "content"):
-        answer = response.content
+    # Step 1: Attempt Cloud LLM if token configured and not bypassed
+    if HF_TOKEN and not force_local:
+        try:
+            print("[LLM] Attempting inference with Cloud Provider: Hugging Face")
+            llm = get_llm()
+            response = llm.invoke(formatted_prompt)
+            if hasattr(response, "content"):
+                answer_raw = response.content
+            else:
+                answer_raw = str(response)
+            print("[LLM] Provider: Hugging Face (success)")
+            if "current_provider" in st.session_state:
+                st.session_state["current_provider"] = "Hugging Face"
+        except Exception as cloud_exc:
+            safe_reason = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(cloud_exc))
+            print("[LLM] Cloud inference failed")
+            print(f"[LLM] Reason: {safe_reason}")
+            print("[LLM] Switching to local LLM")
+            answer_raw = None
     else:
-        answer = str(response)
+        if force_local:
+            print("[LLM] Cloud inference bypassed (FORCE_LOCAL_LLM=1)")
+        else:
+            print("[LLM] Cloud inference unavailable (HF_TOKEN missing)")
+        print("[LLM] Switching to local LLM")
+        answer_raw = None
 
-    answer_clean = answer.strip()
+    # Step 2: Fall back to Local GGUF LLM if cloud failed or bypassed
+    if answer_raw is None:
+        print("-" * 50)
+        print("[LOCAL RAG DIAGNOSTICS]")
+        print(f"Question: {question}")
+        retrieved_count = len(docs) if docs is not None else "N/A"
+        print(f"Retrieved chunks: {retrieved_count}")
+        print(f"Context characters: {len(context)}")
+        top_snippet = docs[0].page_content[:150] if docs and len(docs) > 0 else context[:150]
+        print(f"Top chunk: {top_snippet}...")
+        print("-" * 50)
+        print("[LLM] Provider: Local GGUF")
+        if "current_provider" in st.session_state:
+            st.session_state["current_provider"] = "Local GGUF"
+
+        local_llm = get_fallback_llm()
+        answer_raw = local_llm.invoke(formatted_prompt)
+
+    answer_clean = answer_raw.strip()
 
     # Targeted refusal detection: only return fallback when model explicitly gives a short refusal
     lower_ans = answer_clean.lower()
@@ -1061,7 +1108,9 @@ if st.session_state.video_processed:
                     print(f"Top retrieved chunk snippet: {docs[0].page_content[:120]}...")
                 print("-" * 50)
 
-                answer = generate_answer(context_str, user_query)
+                answer = generate_answer(context_str, user_query, docs=docs)
+                if st.session_state.get("current_provider") == "Local GGUF":
+                    st.caption("☁️ Cloud AI unavailable — using local AI model.")
                 st.write(answer)
 
                 sources_payload = []
