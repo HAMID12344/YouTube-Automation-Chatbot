@@ -68,46 +68,109 @@ LOCAL_MODEL_PATH = get_secret(
 
 st.set_page_config(
     page_title="YouTube & Video RAG AI",
-    page_icon="🎬",
+    page_icon="🎥",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
+# Custom Dark AI Dashboard Theme CSS
 st.markdown(
     """
     <style>
-        .main-title {
-            font-size: 38px;
-            font-weight: 800;
-            color: #1E293B;
-            margin-bottom: 4px;
+        /* Base Background & Typography */
+        .stApp {
+            background: linear-gradient(180deg, #0B0F19 0%, #111827 100%);
+            color: #F3F4F6;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         }
-        .subtitle {
-            font-size: 18px;
-            color: #64748B;
-            margin-bottom: 24px;
-        }
-        .info-card {
-            background-color: #F8FAFC;
-            border: 1px solid #E2E8F0;
-            border-radius: 10px;
-            padding: 16px 20px;
-            margin-top: 15px;
+
+        /* Glassmorphism Cards */
+        .glass-card {
+            background: rgba(17, 24, 39, 0.7);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 12px;
+            padding: 20px;
             margin-bottom: 20px;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
         }
-        .info-header {
-            font-size: 16px;
-            font-weight: 700;
-            color: #0F172A;
-            margin-bottom: 10px;
+
+        .feature-card {
+            background: rgba(31, 41, 55, 0.5);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 10px;
+            padding: 16px;
+            text-align: center;
+            transition: transform 0.2s ease, border-color 0.2s ease;
         }
-        .badge {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 4px;
+        .feature-card:hover {
+            border-color: rgba(99, 102, 241, 0.4);
+            transform: translateY(-2px);
+        }
+
+        /* Badges & Status */
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(34, 197, 94, 0.12);
+            border: 1px solid rgba(34, 197, 94, 0.3);
+            padding: 4px 12px;
+            border-radius: 9999px;
             font-size: 12px;
             font-weight: 600;
-            background-color: #E0E7FF;
-            color: #3730A3;
+            color: #4ADE80;
+        }
+        .status-dot {
+            width: 7px;
+            height: 7px;
+            background-color: #22C55E;
+            border-radius: 50%;
+            box-shadow: 0 0 8px #22C55E;
+        }
+
+        .tag-pill {
+            display: inline-block;
+            background: rgba(99, 102, 241, 0.15);
+            border: 1px solid rgba(99, 102, 241, 0.3);
+            color: #A5B4FC;
+            font-size: 12px;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 6px;
+        }
+
+        /* Streamlit Input Enhancements */
+        .stTextInput > div > div > input {
+            background-color: rgba(31, 41, 55, 0.8) !important;
+            color: #F9FAFB !important;
+            border: 1px solid rgba(255, 255, 255, 0.12) !important;
+            border-radius: 8px !important;
+        }
+        .stTextInput > div > div > input:focus {
+            border-color: #6366F1 !important;
+            box-shadow: 0 0 0 1px #6366F1 !important;
+        }
+
+        /* Buttons */
+        .stButton > button {
+            border-radius: 8px !important;
+            font-weight: 600 !important;
+            transition: all 0.2s ease !important;
+        }
+
+        /* Chat Message Styling */
+        .stChatMessage {
+            background-color: rgba(17, 24, 39, 0.6) !important;
+            border: 1px solid rgba(255, 255, 255, 0.05) !important;
+            border-radius: 12px !important;
+            margin-bottom: 12px !important;
+        }
+
+        /* Sidebar Styling */
+        section[data-testid="stSidebar"] {
+            background-color: #0A0E17 !important;
+            border-right: 1px solid rgba(255, 255, 255, 0.06);
         }
     </style>
     """,
@@ -146,7 +209,7 @@ initialize_session_state()
 def require_hf_token():
     if not HF_TOKEN:
         raise RuntimeError(
-            "Hugging Face token is missing. Please configure HF_TOKEN in your .env file."
+            "HF_TOKEN is not configured. Add your Hugging Face token to .env."
         )
 
 def extract_video_id(value: str) -> str:
@@ -169,7 +232,8 @@ def extract_video_id(value: str) -> str:
             return match.group(1)
 
     raise ValueError(
-        "Invalid YouTube URL or ID. Supported formats include youtube.com/watch?v=..., youtu.be/..., and youtube.com/shorts/..."
+        "Invalid YouTube URL or ID. Please check the URL and try again. "
+        "Supported formats: youtube.com/watch?v=..., youtu.be/..., and youtube.com/shorts/..."
     )
 
 def compute_file_sha256(file_bytes: bytes) -> str:
@@ -289,7 +353,7 @@ def extract_audio_from_youtube(url_or_id: str) -> Tuple[str, str, Dict[str, Any]
     except Exception as exc:
         shutil.rmtree(temp_dir, ignore_errors=True)
         safe_err = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(exc))
-        raise RuntimeError(f"Failed to download audio with yt-dlp: {safe_err}") from exc
+        raise RuntimeError(f"Unable to process YouTube video. Please check the URL and try again. ({safe_err})") from exc
 
     audio_path = os.path.join(temp_dir, f"{video_id}.mp3")
     if not os.path.exists(audio_path):
@@ -398,9 +462,7 @@ def transcribe_with_whisper(audio_path: str, max_retries: int = 3) -> str:
 
 
 def fetch_fallback_youtube_transcript(video_id: str, preferred_languages: Optional[List[str]] = None) -> str:
-    """
-    Secondary fallback: fetches native YouTube transcript via YouTubeTranscriptApi.
-    """
+    """Secondary fallback: fetches native YouTube transcript via YouTubeTranscriptApi."""
     if preferred_languages is None:
         preferred_languages = ["en", "hi"]
 
@@ -570,35 +632,45 @@ def run_unified_rag_pipeline(
 # ============================================================
 
 with st.sidebar:
-    st.header("⚙️ Settings & Info")
+    st.markdown(
+        """
+        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 20px;">
+            <span style="font-size: 22px;">⚙️</span>
+            <span style="font-size: 20px; font-weight: 700; color: #F3F4F6;">System</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.markdown(
         f"""
-        **Architecture**:
-        - **Audio Extractor**: `yt-dlp` / `imageio-ffmpeg`
-        - **Speech-to-Text**: Hugging Face `{WHISPER_MODEL}`
-        - **Embedding**: `paraphrase-multilingual-MiniLM-L12-v2`
-        - **Vector Store**: `FAISS` (MMR Search)
-        - **LLM**: Hugging Face `{HF_MODEL_ID}` (with local fallback)
-        """
+        <div class="glass-card" style="padding: 14px 16px; margin-bottom: 16px;">
+            <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                <span style="color: #94A3B8; font-size: 13px;">AI Model</span>
+                <span style="color: #F8FAFC; font-size: 13px; font-weight: 600;">Whisper Large v3</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                <span style="color: #94A3B8; font-size: 13px;">Embedding</span>
+                <span style="color: #F8FAFC; font-size: 13px; font-weight: 600;">MiniLM (384d)</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                <span style="color: #94A3B8; font-size: 13px;">Vector Store</span>
+                <span style="color: #F8FAFC; font-size: 13px; font-weight: 600;">FAISS (In-Memory)</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                <span style="color: #94A3B8; font-size: 13px;">LLM</span>
+                <span style="color: #F8FAFC; font-size: 13px; font-weight: 600;">Hugging Face</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, 0.08);">
+                <span style="color: #94A3B8; font-size: 13px;">Status</span>
+                <span style="color: #4ADE80; font-size: 13px; font-weight: 600;">🟢 Online</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
+
     st.divider()
-
-    if st.session_state.video_processed:
-        st.subheader("📹 Active Video Summary")
-        meta = st.session_state.video_metadata
-        st.write(f"**Title**: {meta.get('title', 'N/A')}")
-        st.write(f"**Source Type**: `{st.session_state.source_type}`")
-        if st.session_state.source_type == "YouTube":
-            st.write(f"**Author**: {meta.get('uploader', 'N/A')}")
-            st.write(f"**Duration**: {meta.get('duration', 'N/A')} seconds")
-        else:
-            st.write(f"**Filename**: {meta.get('filename', 'N/A')}")
-            st.write(f"**File Size**: {meta.get('size_mb', 'N/A')} MB")
-
-        st.write(f"**Transcription Source**: `{st.session_state.transcript_source}`")
-        st.write(f"**Chunks**: `{st.session_state.chunk_count}`")
-        st.write(f"**Vector Store**: `Active (FAISS)`")
-        st.divider()
 
     col1, col2 = st.columns(2)
     with col1:
@@ -606,7 +678,7 @@ with st.sidebar:
             st.session_state.messages = []
             st.rerun()
     with col2:
-        if st.button("🔄 Reset All", use_container_width=True):
+        if st.button("🔄 Reset Video", use_container_width=True):
             for k in [
                 "messages", "vector_store", "retriever", "video_processed",
                 "video_metadata", "transcript_text", "transcript_source",
@@ -624,25 +696,50 @@ with st.sidebar:
             st.rerun()
 
 # ============================================================
-# MAIN UI
+# PREMIUM HEADER
 # ============================================================
 
-st.markdown('<div class="main-title">YouTube & Video RAG AI</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Upload a video or paste a YouTube URL and ask questions about its content.</div>', unsafe_allow_html=True)
+st.markdown(
+    """
+    <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 15px; margin-bottom: 24px;">
+        <div>
+            <h1 style="margin: 0; font-size: 34px; font-weight: 800; color: #FFFFFF; letter-spacing: -0.5px;">
+                🎥 YouTube & Video RAG AI
+            </h1>
+            <p style="margin: 6px 0 0 0; color: #94A3B8; font-size: 16px;">
+                Turn any video into an interactive knowledge base.
+            </p>
+        </div>
+        <div class="status-badge">
+            <span class="status-dot"></span>
+            <span>● AI System Online</span>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 if not HF_TOKEN:
-    st.warning("⚠️ Hugging Face token is missing. Please add `HF_TOKEN` to your `.env` file.")
+    st.error("HF_TOKEN is not configured. Add your Hugging Face token to .env.")
+
+# ============================================================
+# MAIN INPUT SECTION: TWO TABS
+# ============================================================
 
 tab_yt, tab_upload = st.tabs(["📺 YouTube Video", "📁 Upload Video"])
 
 # TAB 1: YOUTUBE INGESTION
 with tab_yt:
+    st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
     yt_url = st.text_input(
         "YouTube Video URL or ID",
-        placeholder="e.g. https://www.youtube.com/watch?v=jNQXAC9IVRw or youtu.be/...",
+        placeholder="https://www.youtube.com/watch?v=...",
         key="yt_input_url",
+        help="Supported: youtube.com/watch?v=..., youtu.be/..., and youtube.com/shorts/...",
     )
-    process_yt = st.button("🚀 Process Video", type="primary", key="btn_process_yt")
+    st.caption("Supported URL formats: `youtube.com/watch?v=...`, `youtu.be/...`, `youtube.com/shorts/...`")
+
+    process_yt = st.button("🚀 Process YouTube Video", type="primary", key="btn_process_yt")
 
     if process_yt:
         if not yt_url.strip():
@@ -670,24 +767,21 @@ with tab_yt:
                     st.session_state.chunk_count = cached["chunk_count"]
                     st.session_state.processed_identifier = vid_id
                     st.session_state.messages = []
-                    st.success("✅ Loaded from session cache! Video is ready.")
+                    st.success("✓ Video successfully processed (from session cache).")
                 else:
                     with st.status("Processing Video...", expanded=True) as status:
-                        st.write("Step 1/5: Downloading video audio...")
+                        st.write("01 Audio Extraction")
                         audio_path, temp_dir, meta = extract_audio_from_youtube(yt_url)
-
-                        st.write("Step 2/5: Extracting audio...")
-                        # Audio already extracted to audio_path via yt-dlp postprocessor
 
                         transcript = None
                         source_used = None
 
                         try:
-                            st.write(f"Step 3/5: Transcribing with Whisper Large v3 (`{WHISPER_MODEL}`)...")
+                            st.write("02 Whisper Transcription")
                             transcript = transcribe_with_whisper(audio_path)
                             source_used = f"Whisper ({WHISPER_MODEL})"
                         except Exception as whisper_err:
-                            st.warning(f"Whisper API notice: {whisper_err}. Attempting YouTube transcript fallback...")
+                            st.warning("Whisper API note: using secondary transcript fallback...")
                             try:
                                 transcript = fetch_fallback_youtube_transcript(vid_id)
                                 source_used = "youtube_transcript_api (fallback)"
@@ -696,24 +790,27 @@ with tab_yt:
                         finally:
                             shutil.rmtree(temp_dir, ignore_errors=True)
 
-                        st.write("Step 4/5: Creating embeddings...")
-                        st.write("Step 5/5: Building FAISS knowledge base...")
+                        st.write("03 Text Chunking")
+                        st.write("04 Embedding Generation")
+                        st.write("05 FAISS Indexing")
                         run_unified_rag_pipeline(transcript, source_used, "YouTube", meta, vid_id)
 
-                        status.update(label="✅ Video processed successfully.", state="complete")
-                    st.success("✅ Video processed successfully.")
+                        status.update(label="✓ Video successfully processed", state="complete")
+                    st.success("✓ Video successfully processed")
             except Exception as e:
                 safe_msg = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(e))
-                st.error(f"Error processing YouTube video: {safe_msg}")
+                st.error(f"❌ Unable to process video: {safe_msg}")
 
 # TAB 2: UPLOADED VIDEO INGESTION
 with tab_upload:
+    st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
     uploaded_file = st.file_uploader(
         "Upload a video file",
         type=["mp4", "mov", "mkv", "avi", "webm"],
         key="uploaded_file_input",
+        help="Supported formats: MP4, MOV, MKV, AVI, WEBM",
     )
-    process_upload = st.button("🚀 Process Video", type="primary", key="btn_process_upload")
+    process_upload = st.button("🚀 Process Uploaded Video", type="primary", key="btn_process_upload")
 
     if process_upload:
         if not uploaded_file:
@@ -742,66 +839,124 @@ with tab_upload:
                     st.session_state.chunk_count = cached["chunk_count"]
                     st.session_state.processed_identifier = file_hash
                     st.session_state.messages = []
-                    st.success("✅ Loaded from session cache! Video is ready.")
+                    st.success("✓ Video successfully processed (from session cache).")
                 else:
                     with st.status("Processing Video...", expanded=True) as status:
-                        st.write("Step 1/5: Reading uploaded video...")
-                        # File read into buffer
-
-                        st.write("Step 2/5: Extracting audio...")
+                        st.write("01 Audio Extraction")
                         audio_path, temp_dir, meta = extract_audio_from_video_file(uploaded_file)
 
                         try:
-                            st.write(f"Step 3/5: Transcribing with Whisper Large v3 (`{WHISPER_MODEL}`)...")
+                            st.write("02 Whisper Transcription")
                             transcript = transcribe_with_whisper(audio_path)
                             source_used = f"Whisper ({WHISPER_MODEL})"
                         finally:
                             shutil.rmtree(temp_dir, ignore_errors=True)
 
-                        st.write("Step 4/5: Creating embeddings...")
-                        st.write("Step 5/5: Building FAISS knowledge base...")
+                        st.write("03 Text Chunking")
+                        st.write("04 Embedding Generation")
+                        st.write("05 FAISS Indexing")
                         run_unified_rag_pipeline(transcript, source_used, "Uploaded Video", meta, file_hash)
 
-                        status.update(label="✅ Video processed successfully.", state="complete")
-                    st.success("✅ Video processed successfully.")
+                        status.update(label="✓ Video successfully processed", state="complete")
+                    st.success("✓ Video successfully processed")
             except Exception as e:
                 safe_msg = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(e))
-                st.error(f"Error processing uploaded video: {safe_msg}")
+                st.error(f"❌ Unable to process video: {safe_msg}")
 
 # ============================================================
-# PHASE 4: VIDEO INFORMATION CARD
+# VIDEO INFORMATION CARD (AFTER PROCESSING)
 # ============================================================
 
 if st.session_state.video_processed:
     meta = st.session_state.video_metadata
     st.markdown(
         f"""
-        <div class="info-card">
-            <div class="info-header">📹 Video Information</div>
-            <b>Video title:</b> {meta.get('title', 'N/A')}<br>
-            <b>Source type:</b> <span class="badge">{st.session_state.source_type}</span><br>
-            {f"<b>Channel / Author:</b> {meta.get('uploader', 'N/A')}<br>" if st.session_state.source_type == 'YouTube' else ""}
-            {f"<b>YouTube URL:</b> <a href='{meta.get('url', '#')}' target='_blank'>{meta.get('url', 'N/A')}</a><br>" if st.session_state.source_type == 'YouTube' else ""}
-            {f"<b>File name:</b> {meta.get('filename', 'N/A')}<br>" if st.session_state.source_type != 'YouTube' else ""}
-            <b>Duration:</b> {meta.get('duration', 'N/A')}s<br>
-            <b>Transcript length:</b> {len(st.session_state.transcript_text):,} characters<br>
-            <b>Number of chunks:</b> {st.session_state.chunk_count}<br>
-            <b>Vector index status:</b> <span style="color:#16A34A; font-weight:600;">Active (In-Memory FAISS)</span>
+        <div class="glass-card" style="margin-top: 20px;">
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px;">
+                <div>
+                    <div style="font-size: 12px; font-weight: 700; color: #94A3B8; letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 10px;">
+                        📹 Video Information
+                    </div>
+                    <div style="font-size: 17px; font-weight: 700; color: #F8FAFC; margin-bottom: 6px;">
+                        {meta.get('title', 'Video')}
+                    </div>
+                    <div style="color: #94A3B8; font-size: 14px; margin-bottom: 4px;">
+                        <b>Source:</b> <span class="tag-pill">{st.session_state.source_type}</span>
+                    </div>
+                    {f"<div style='color: #94A3B8; font-size: 14px; margin-bottom: 4px;'><b>Channel / Author:</b> {meta.get('uploader', 'N/A')}</div>" if st.session_state.source_type == 'YouTube' else ""}
+                    {f"<div style='color: #94A3B8; font-size: 14px; margin-bottom: 4px;'><b>File Name:</b> {meta.get('filename', 'N/A')} ({meta.get('size_mb', 'N/A')} MB)</div>" if st.session_state.source_type != 'YouTube' else ""}
+                    {f"<div style='color: #94A3B8; font-size: 14px; margin-bottom: 4px;'><b>YouTube URL:</b> <a href='{meta.get('url', '#')}' target='_blank' style='color:#818CF8;'>Link</a></div>" if st.session_state.source_type == 'YouTube' else ""}
+                    <div style="color: #94A3B8; font-size: 14px;">
+                        <b>Duration:</b> {meta.get('duration', 'N/A')} seconds
+                    </div>
+                </div>
+                <div style="border-left: 1px solid rgba(255, 255, 255, 0.08); padding-left: 20px;">
+                    <div style="font-size: 12px; font-weight: 700; color: #94A3B8; letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 10px;">
+                        🧠 RAG Architecture & Metrics
+                    </div>
+                    <div style="color: #94A3B8; font-size: 14px; margin-bottom: 6px;">
+                        <b>Vector Store:</b> <span style="color:#4ADE80; font-weight:600;">FAISS • Active</span>
+                    </div>
+                    <div style="color: #94A3B8; font-size: 14px; margin-bottom: 6px;">
+                        <b>Embedding:</b> <span style="color:#A5B4FC;">MiniLM • 384 dimensions</span>
+                    </div>
+                    <div style="color: #94A3B8; font-size: 14px; margin-bottom: 6px;">
+                        <b>Number of Chunks:</b> {st.session_state.chunk_count}
+                    </div>
+                    <div style="color: #94A3B8; font-size: 14px;">
+                        <b>Transcript Characters:</b> {len(st.session_state.transcript_text):,}
+                    </div>
+                </div>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 # ============================================================
-# CHAT INTERFACE & SOURCES
+# WELCOME STATE (BEFORE VIDEO IS PROCESSED)
 # ============================================================
 
-st.divider()
-st.subheader("💬 Ask Questions About This Video")
-
 if not st.session_state.video_processed:
-    st.info("👈 Please process a YouTube video or upload a video file above to start asking questions!")
-else:
+    st.markdown(
+        """
+        <div class="glass-card" style="text-align: center; padding: 36px 24px; margin-top: 25px;">
+            <h2 style="margin: 0 0 10px 0; color: #F8FAFC; font-size: 24px; font-weight: 700;">
+                🎬 Your video knowledge base is waiting
+            </h2>
+            <p style="margin: 0 0 28px 0; color: #94A3B8; font-size: 15px;">
+                Paste a YouTube URL or upload a video to get started.
+            </p>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; text-align: left;">
+                <div class="feature-card">
+                    <div style="font-size: 24px; margin-bottom: 8px;">🎙️</div>
+                    <div style="font-weight: 600; color: #F8FAFC; font-size: 15px; margin-bottom: 4px;">Whisper Transcription</div>
+                    <div style="color: #94A3B8; font-size: 13px;">Accurate speech-to-text</div>
+                </div>
+                <div class="feature-card">
+                    <div style="font-size: 24px; margin-bottom: 8px;">🧠</div>
+                    <div style="font-weight: 600; color: #F8FAFC; font-size: 15px; margin-bottom: 4px;">AI Retrieval</div>
+                    <div style="color: #94A3B8; font-size: 13px;">FAISS-powered semantic search</div>
+                </div>
+                <div class="feature-card">
+                    <div style="font-size: 24px; margin-bottom: 8px;">💬</div>
+                    <div style="font-weight: 600; color: #F8FAFC; font-size: 15px; margin-bottom: 4px;">Grounded Answers</div>
+                    <div style="color: #94A3B8; font-size: 13px;">Answers based on your video</div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# ============================================================
+# CHAT SECTION (AFTER PROCESSING)
+# ============================================================
+
+if st.session_state.video_processed:
+    st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
+    st.subheader("💬 Ask anything about this video")
+
     # Render previous conversation
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
@@ -811,12 +966,12 @@ else:
                     for idx, s in enumerate(msg["sources"], 1):
                         st.markdown(f"**Source:** {s.get('source', 'Video Transcript')}")
                         st.markdown(f"**Timestamp:** {s.get('timestamp', 'N/A (Full Clip Transcript)')}")
-                        st.markdown(f"**Relevant Text:**\n> {s.get('text', '')}")
+                        st.markdown(f"**Relevant Transcript:**\n> {s.get('text', '')}")
                         if idx < len(msg["sources"]):
                             st.divider()
 
     # Handle user query
-    if user_query := st.chat_input("What are the main points discussed in this video?"):
+    if user_query := st.chat_input("Ask anything about this video..."):
         st.session_state.messages.append({"role": "user", "content": user_query})
         with st.chat_message("user"):
             st.write(user_query)
@@ -846,7 +1001,7 @@ else:
                             for idx, s in enumerate(sources_payload, 1):
                                 st.markdown(f"**Source:** {s['source']}")
                                 st.markdown(f"**Timestamp:** {s['timestamp']}")
-                                st.markdown(f"**Relevant Text:**\n> {s['text']}")
+                                st.markdown(f"**Relevant Transcript:**\n> {s['text']}")
                                 if idx < len(sources_payload):
                                     st.divider()
 
