@@ -460,10 +460,10 @@ def get_llm():
 # AUDIO EXTRACTION
 # ============================================================
 
-def extract_audio_from_youtube(url_or_id: str) -> Tuple[str, str, Dict[str, Any]]:
+def extract_audio_from_youtube(url_or_id: str) -> Tuple[str, str, Dict[str, Any], Optional[str]]:
     """
-    Uses yt-dlp to extract audio from a YouTube video to a temporary MP3 file.
-    Returns: (audio_path, temp_dir, metadata_dict)
+    Downloads audio and lightweight video stream from YouTube via yt-dlp using bundled ffmpeg.
+    Returns: (audio_path, temp_dir, metadata_dict, video_path)
     """
     video_id = extract_video_id(url_or_id)
     url = f"https://www.youtube.com/watch?v={video_id}"
@@ -473,9 +473,10 @@ def extract_audio_from_youtube(url_or_id: str) -> Tuple[str, str, Dict[str, Any]
     out_template = os.path.join(temp_dir, f"{video_id}.%(ext)s")
 
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": "best[height<=360]/best[ext=mp4]/bestaudio/best",
         "outtmpl": out_template,
         "ffmpeg_location": ffmpeg_exe,
+        "keepvideo": True,
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
@@ -503,6 +504,16 @@ def extract_audio_from_youtube(url_or_id: str) -> Tuple[str, str, Dict[str, Any]
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise RuntimeError("Audio extraction completed but output audio file was not found.")
 
+    # Find the preserved video file for frame extraction
+    video_path = None
+    v_candidates = [
+        os.path.join(temp_dir, f)
+        for f in os.listdir(temp_dir)
+        if f.endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov')) and not f.endswith('.mp3')
+    ]
+    if v_candidates:
+        video_path = v_candidates[0]
+
     metadata = {
         "id": video_id,
         "title": info.get("title", f"YouTube Video {video_id}"),
@@ -510,7 +521,7 @@ def extract_audio_from_youtube(url_or_id: str) -> Tuple[str, str, Dict[str, Any]
         "uploader": info.get("uploader", "Unknown"),
         "url": url,
     }
-    return audio_path, temp_dir, metadata
+    return audio_path, temp_dir, metadata, video_path
 
 
 def extract_audio_from_video_file(uploaded_file) -> Tuple[str, str, Dict[str, Any], str]:
@@ -1340,6 +1351,9 @@ with tab_yt:
                     cached = st.session_state.processed_cache[vid_id]
                     st.session_state.vector_store = cached["vector_store"]
                     st.session_state.retriever = cached["retriever"]
+                    st.session_state.visual_records = cached.get("visual_records", [])
+                    st.session_state.visual_vector_store = cached.get("visual_vector_store")
+                    st.session_state.visual_retriever = cached.get("visual_retriever")
                     st.session_state.video_processed = True
                     st.session_state.source_type = cached["source_type"]
                     st.session_state.video_metadata = cached["video_metadata"]
@@ -1352,8 +1366,8 @@ with tab_yt:
                     st.success("✓ Video successfully processed (from session cache).")
                 else:
                     with st.status("🎥 Processing video...", expanded=True) as status:
-                        st.write("🔊 Extracting audio...")
-                        audio_path, temp_dir, meta = extract_audio_from_youtube(yt_url)
+                        st.write("🔊 Extracting audio & video...")
+                        audio_path, temp_dir, meta, video_path = extract_audio_from_youtube(yt_url)
 
                         transcript = None
                         source_used = None
@@ -1394,12 +1408,34 @@ with tab_yt:
                                 transcript = transcribe_audio_local(audio_path)
                                 source_used = "Local Whisper (faster-whisper base)"
 
+                        # Real Video Frame Extraction & Visual Analysis for YouTube
+                        visual_records = []
+                        if video_path and os.path.exists(video_path):
+                            st.write("👁️ Analyzing video frames...")
+                            frame_tuples = extract_video_frames(video_path, interval_seconds=FRAME_INTERVAL_SECONDS)
+                            for fpath, ts_sec, ts_fmt, f_idx in frame_tuples:
+                                desc = analyze_frame_visual(fpath, ts_fmt)
+                                visual_records.append({
+                                    "timestamp": ts_fmt,
+                                    "timestamp_sec": ts_sec,
+                                    "frame_index": f_idx,
+                                    "source_video_id": vid_id,
+                                    "description": desc,
+                                    "frame_path": fpath
+                                })
+
                         shutil.rmtree(temp_dir, ignore_errors=True)
 
-                        
-                        
-                        st.write("🧠 Building video knowledge base...")
-                        run_unified_rag_pipeline(transcript, source_used, "YouTube", meta, vid_id, playback_source=f"https://www.youtube.com/watch?v={vid_id}")
+                        st.write("🧠 Building multimodal knowledge base...")
+                        run_unified_rag_pipeline(
+                            transcript,
+                            source_used,
+                            "YouTube",
+                            meta,
+                            vid_id,
+                            playback_source=f"https://www.youtube.com/watch?v={vid_id}",
+                            visual_records=visual_records
+                        )
 
                         status.update(label="✅ Video ready!", state="complete", expanded=False)
             except Exception as e:
