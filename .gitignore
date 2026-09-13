@@ -18,5 +18,6 @@ ENV/
 temp_audio/
 *.mp3
 *.wav
-*.mp4
-.DS_Store
+# Models
+models/*.gguf
+*.gguf

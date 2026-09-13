@@ -15,5 +15,4 @@ langchain-text-splitters
 faiss-cpu
 sentence-transformers
 huggingface-hub
-torchvision
 requests

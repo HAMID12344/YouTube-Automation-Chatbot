@@ -315,18 +315,72 @@ Answer: The dog is trained using treats and positive reinforcement."""
         )
         return res["choices"][0]["message"]["content"].strip()
 
+class LocalExtractiveFallbackLLM:
+    """
+    Resilient, deterministic extractive RAG fallback used when neither Cloud LLM
+    nor local GGUF weights are available. Extracts grounded answers directly from
+    retrieved context chunks without hallucination.
+    """
+    def invoke(self, prompt: str, context: Optional[str] = None, question: Optional[str] = None) -> str:
+        if not context and "Context:" in prompt and "Question:" in prompt:
+            try:
+                parts = prompt.split("Context:", 1)[1].split("Question:", 1)
+                context = parts[0].strip()
+                question = parts[1].split("Answer:", 1)[0].strip()
+            except Exception:
+                context = prompt
+                question = ""
+
+        if not context or not context.strip():
+            return "I couldn't find the answer to that in the video."
+
+        # Verify subject keywords appear in context
+        if question:
+            general_terms = {
+                "what", "who", "where", "when", "why", "how", "which", "is", "are", "was", "were", 
+                "the", "a", "an", "in", "on", "at", "of", "to", "for", "and", "or", "not", "this", 
+                "that", "video", "about", "main", "points", "summary", "summarize"
+            }
+            q_keywords = [w for w in re.findall(r"\b[a-zA-Z0-9]+\b", question.lower()) if w not in general_terms and len(w) >= 3]
+            if q_keywords and not any(kw in context.lower() for kw in q_keywords):
+                return "I couldn't find the answer to that in the video."
+
+        lower_q = (question or "").lower()
+        if any(term in lower_q for term in ["about", "main points", "summary", "overview", "what is this video"]):
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", context) if len(s.strip()) > 20]
+            if sentences:
+                return "Here is what the video discusses:\n- " + "\n- ".join(sentences[:5])
+
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", context) if len(s.strip()) > 15]
+        if not sentences:
+            sentences = [context[:300]]
+
+        if question and q_keywords:
+            scored = []
+            for s in sentences:
+                s_lower = s.lower()
+                matches = sum(1 for kw in q_keywords if kw in s_lower)
+                scored.append((matches, s))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            best_matches = [s for count, s in scored if count > 0]
+            if best_matches:
+                return " ".join(best_matches[:3])
+
+        return sentences[0] if sentences else "I couldn't find the answer to that in the video."
+
+
 @st.cache_resource(show_spinner=False)
 def get_fallback_llm():
-    if not LOCAL_MODEL_PATH or not os.path.exists(LOCAL_MODEL_PATH):
-        err_msg = f"Local AI model is not configured. Expected GGUF model file not found at: '{LOCAL_MODEL_PATH}'"
-        print(f"[LLM] ERROR: {err_msg}")
-        raise FileNotFoundError(err_msg)
-    try:
-        print(f"[LLM] Initializing local GGUF model from: {LOCAL_MODEL_PATH}")
-        return LocalGGUFLLM(LOCAL_MODEL_PATH)
-    except Exception as e:
-        print(f"[LLM] Failed to load local GGUF model: {e}")
-        raise RuntimeError(f"Failed to load local GGUF model from {LOCAL_MODEL_PATH}: {e}") from e
+    if LOCAL_MODEL_PATH and os.path.exists(LOCAL_MODEL_PATH):
+        try:
+            print(f"[LLM] Initializing local GGUF model from: {LOCAL_MODEL_PATH}")
+            return LocalGGUFLLM(LOCAL_MODEL_PATH)
+        except Exception as e:
+            print(f"[LLM] Warning: Failed to load local GGUF model: {e}. Falling back to Extractive RAG.")
+            return LocalExtractiveFallbackLLM()
+    else:
+        print("[LLM] Local GGUF model not found on disk. Initializing resilient Extractive RAG Fallback.")
+        return LocalExtractiveFallbackLLM()
 
 @st.cache_resource(show_spinner=False)
 def get_llm():
@@ -565,14 +619,18 @@ def split_text(transcript: str) -> List[Any]:
         chunk_overlap=200,
         separators=["\n\n", "\n", ". ", "? ", "! ", " ", ""],
     )
-    return splitter.create_documents([transcript])
+    docs = splitter.create_documents([transcript])
+    return [d for d in docs if d.page_content and d.page_content.strip()]
 
 def create_vector_store(chunks: List[Any]):
     embeddings = get_embeddings()
     return FAISS.from_documents(chunks, embeddings)
 
-def create_retriever(vector_store, chunk_count: int = 4):
-    k = min(4, max(1, chunk_count))
+def create_retriever(vector_store, chunk_count: int = 8):
+    if chunk_count >= 5:
+        k = min(8, max(5, chunk_count))
+    else:
+        k = max(1, chunk_count)
     return vector_store.as_retriever(
         search_type="similarity",
         search_kwargs={"k": k},
@@ -673,12 +731,17 @@ def generate_answer(context: str, question: str, docs: Optional[List[Any]] = Non
         top_snippet = docs[0].page_content[:150] if docs and len(docs) > 0 else context[:150]
         print(f"Top chunk: {top_snippet}...")
         print("-" * 50)
-        print("[LLM] Provider: Local GGUF")
-        if "current_provider" in st.session_state:
-            st.session_state["current_provider"] = "Local GGUF"
-
         local_llm = get_fallback_llm()
-        answer_raw = local_llm.invoke(formatted_prompt)
+        if isinstance(local_llm, LocalGGUFLLM):
+            print("[LLM] Provider: Local GGUF")
+            if "current_provider" in st.session_state:
+                st.session_state["current_provider"] = "Local GGUF (qwen2.5-0.5b)"
+            answer_raw = local_llm.invoke(formatted_prompt)
+        else:
+            print("[LLM] Provider: Local Extractive Fallback")
+            if "current_provider" in st.session_state:
+                st.session_state["current_provider"] = "Local Extractive Fallback"
+            answer_raw = local_llm.invoke(formatted_prompt, context=context, question=question)
 
     answer_clean = answer_raw.strip()
 

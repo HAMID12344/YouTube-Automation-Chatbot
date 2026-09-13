@@ -8,117 +8,106 @@ app_port: 7860
 pinned: false
 ---
 
-# LocalMind AI — Video & YouTube Automation Chatbot (RAG)
+# YouTube Automation Chatbot
 
-> **Chat with YouTube videos and local video files using Retrieval-Augmented Generation (RAG)!**
+An intelligent Video Question-Answering Chatbot built with Streamlit, FAISS, Whisper, and Retrieval-Augmented Generation (RAG). Supports both YouTube URLs and local video file uploads.
 
-An intelligent **Video Question-Answering Chatbot** built with Streamlit, FAISS, Whisper, and Dual LLM (Cloud + Local GGUF).
+## Features
 
-The application supports both YouTube links and uploaded video files (MP4, MKV, MOV, WebM, AVI), extracting audio, generating transcripts via Whisper, chunking text, indexing vectors in FAISS, and answering questions strictly grounded in the video's content—even without cloud credits or an internet connection.
+- Upload local videos (MP4, MKV, MOV, WebM, AVI)
+- YouTube URL support
+- Automatic audio extraction
+- Whisper transcription (faster-whisper CPU INT8 with Cloud Whisper support)
+- Semantic chunking (RecursiveCharacterTextSplitter 1000/200)
+- Sentence Transformer embeddings (paraphrase-multilingual-MiniLM-L12-v2)
+- FAISS vector search
+- RAG question answering
+- Local LLM fallback (Qwen GGUF / Extractive RAG fallback)
+- Grounded answers (returns strictly *I couldn't find the answer to that in the video.* for out-of-scope queries)
+- Video isolation (clears state, cache, and vector store between videos)
 
----
-
-## 🚀 Key Features
-
-| Feature | Description |
-|---|---|
-| 📺 **YouTube Integration** | Extract transcripts from YouTube URLs with yt-dlp and fallback caption extraction |
-| 📁 **Local Video Upload** | Upload MP4, MKV, MOV, WEBM, AVI files (up to 200MB) with in-memory audio extraction |
-| 🎙️ **Dual Whisper Transcription** | Hugging Face Cloud Whisper with automatic fallback to local `faster-whisper` (CPU INT8) |
-| 🧠 **Semantic Chunking** | Splits transcripts using `RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)` |
-| ⚡ **Local Embeddings** | Fast, offline 384-dimensional embeddings via `paraphrase-multilingual-MiniLM-L12-v2` |
-| 🔍 **In-Memory FAISS Vector Store** | Real-time similarity retrieval of the most relevant transcript passages |
-| 🤖 **Dual LLM Architecture** | Cloud LLM (Qwen2.5-72B via Hugging Face) + In-Process Local GGUF (`qwen2.5-0.5b-instruct` via `llama-cpp-python`) |
-| 🛡️ **Grounding Protection** | Returns *"I couldn't find the answer to that in the video."* for out-of-scope trivia; protects valid qualifying phrases |
-| 🔄 **Video Isolation** | Clear session state and vector store resets when switching between videos |
-
----
-
-## 🛠️ Architecture & Pipeline
+## Architecture
 
 ```
-USER UPLOADS VIDEO / YOUTUBE URL
-               ↓
-     AUDIO EXTRACTION (ffmpeg)
-               ↓
-   WHISPER TRANSCRIPTION (Local faster-whisper / Cloud)
-               ↓
-     NORMALIZED TRANSCRIPT
-               ↓
-  TEXT CHUNKING (1000 / 200 overlap)
-               ↓
- LOCAL EMBEDDINGS (SentenceTransformer)
-               ↓
-       FAISS VECTOR STORE
-               ↓
-       USER ASKS QUESTION
-               ↓
-     SIMILARITY RETRIEVAL (Top-k chunks)
-               ↓
- DUAL LLM (Cloud Qwen / Local GGUF fallback)
-               ↓
-        GROUNDED ANSWER
+Video
+  ↓
+Audio Extraction
+  ↓
+Whisper
+  ↓
+Transcript
+  ↓
+Chunking
+  ↓
+Embeddings
+  ↓
+FAISS
+  ↓
+Question
+  ↓
+Retrieval
+  ↓
+LLM
+  ↓
+Answer
 ```
 
----
+## Local Installation
 
-## 📦 Installation & Setup
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/HAMID12344/YouTube-Automation-Chatbot.git
+   cd YouTube-Automation-Chatbot
+   ```
 
-### 1. Clone Repository
-```bash
-git clone https://github.com/HAMID12344/YouTube-Automation-Chatbot.git
-cd YouTube-Automation-Chatbot
-```
+2. **Create and activate a virtual environment:**
+   ```bash
+   python -m venv venv
+   # On Windows:
+   venv\Scripts\activate
+   # On Linux / macOS:
+   source venv/bin/activate
+   ```
 
-### 2. Set Up Virtual Environment
-```bash
-python -m venv venv
-# Windows:
-.\venv\Scripts\activate
-# Linux/macOS:
-source venv/bin/activate
-```
+3. **Install dependencies:**
+   ```bash
+   pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
 
-### 3. Install Dependencies
-```bash
-pip install -r requirements.txt
-```
+4. **Set up environment variables (Optional for Cloud Features):**
+   Create a `.env` file in the root directory:
+   ```env
+   HF_TOKEN="your_huggingface_token_here"
+   HF_MODEL_ID="Qwen/Qwen2.5-Coder-32B-Instruct"
+   ```
 
-### 4. Configure Environment Variables (Optional)
-Create a `.env` file:
-```env
-# Optional: Hugging Face token for cloud inference
-HF_TOKEN=your_huggingface_token_here
+5. **Run the Streamlit application:**
+   ```bash
+   streamlit run app.py
+   ```
 
-# Optional: Force purely local processing (zero cloud credits)
-FORCE_LOCAL_LLM=0
-FORCE_LOCAL_WHISPER=0
+## Usage
 
-# Path to local GGUF model (default: models/qwen2.5-0.5b-instruct-q4_k_m.gguf)
-LOCAL_GGUF_MODEL_PATH=models/qwen2.5-0.5b-instruct-q4_k_m.gguf
-```
+1. Open the application in your browser (`http://localhost:8501` locally or port `7860` in Docker).
+2. Choose your input mode from the sidebar:
+   - **YouTube URL**: Paste any valid YouTube video link and click "Process Video".
+   - **Local Video**: Drag and drop an MP4, MKV, MOV, WEBM, or AVI file.
+3. Wait for audio extraction, Whisper transcription, and vector indexing to complete.
+4. Ask any question in the chat bar. The system will retrieve the most relevant transcript segments and generate a grounded answer.
+5. If you ask a question outside the video's scope, the chatbot responds with:
+   > *I couldn't find the answer to that in the video.*
 
-### 5. Run Streamlit Application
-```bash
-streamlit run app.py
-```
+## Hugging Face Deployment
 
----
+This Space is configured for Hugging Face Spaces using **Docker**:
+- Uses `python:3.11-slim` with system `ffmpeg`, `git`, and build tools.
+- Runs as non-root user `user` (UID `1000`) per Hugging Face Spaces standards.
+- Exposes port `7860` and runs in headless mode (`0.0.0.0:7860`).
+- Container startup command:
+  ```bash
+  streamlit run app.py --server.port=7860 --server.address=0.0.0.0
+  ```
 
-## 📋 Requirements
-- Python 3.10+
-- `streamlit`
-- `faster-whisper`
-- `ctranslate2`
-- `llama-cpp-python`
-- `faiss-cpu`
-- `sentence-transformers`
-- `langchain` & `langchain-community`
-- `imageio-ffmpeg`
-- `yt-dlp`
-
----
-
-## 👤 Author
-**HAMID12344**
-- GitHub: [HAMID12344](https://github.com/HAMID12344)
+### Live Demo
+To be updated after deployment.
