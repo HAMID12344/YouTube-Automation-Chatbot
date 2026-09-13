@@ -64,7 +64,7 @@ WHISPER_MODEL = get_secret("WHISPER_MODEL", "openai/whisper-large-v3")
 YOUTUBE_HTTP_PROXY = get_secret("YOUTUBE_HTTP_PROXY")
 LOCAL_MODEL_PATH = get_secret(
     "LOCAL_MODEL_PATH",
-    r"c:\Users\ahmad\3D Objects\my local ai chat bot\models\qwen2.5-0.5b-instruct-q4_k_m.gguf"
+    os.path.join("models", "qwen2.5-0.5b-instruct-q4_k_m.gguf")
 )
 
 def render_html(html_str: str) -> None:

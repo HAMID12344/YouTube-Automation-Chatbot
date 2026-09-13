@@ -3,9 +3,8 @@ title: YouTube Automation Chatbot
 emoji: 🎥
 colorFrom: red
 colorTo: blue
-sdk: streamlit
-sdk_version: 1.38.0
-app_file: app.py
+sdk: docker
+app_port: 7860
 pinned: false
 ---
 
