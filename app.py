@@ -531,17 +531,13 @@ def create_prompt() -> PromptTemplate:
     template = """You are a video question-answering assistant.
 
 Answer the user's question using ONLY the supplied video transcript context.
+If the user asks for the main points, summary, overview, or what the video is about, summarize the key events, people, and topics discussed in the transcript.
 
 Do not use outside knowledge.
-
 Do not guess.
-
 Do not invent facts.
 
-Do not assume information that is not present in the transcript.
-
-If the answer is not supported by the supplied transcript context, respond exactly:
-
+If the question is unrelated or the answer is not supported by the supplied transcript context, respond exactly:
 I couldn't find the answer to that in the video.
 
 VIDEO TRANSCRIPT CONTEXT:
@@ -591,7 +587,7 @@ def generate_answer(context: str, question: str) -> str:
         "not supported by the supplied transcript",
         "not supported by the video",
     ]
-    if any(p in lower_ans for p in explicit_refusals) and len(answer_clean) < 180:
+    if any(p in lower_ans for p in explicit_refusals) and len(answer_clean) < 260:
         return "I couldn't find the answer to that in the video."
 
     return answer_clean
