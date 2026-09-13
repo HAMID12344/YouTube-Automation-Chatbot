@@ -1,9 +1,11 @@
+import hashlib
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
@@ -38,9 +40,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 load_dotenv()
 
 def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
-    """
-    Reads configuration safely from environment variables (.env) or st.secrets.
-    """
+    """Reads configuration safely from environment variables (.env) or st.secrets."""
     val = os.getenv(name)
     if val:
         return val.strip()
@@ -67,7 +67,7 @@ LOCAL_MODEL_PATH = get_secret(
 )
 
 st.set_page_config(
-    page_title="YouTube & Video RAG Chatbot",
+    page_title="YouTube & Video RAG AI",
     page_icon="🎬",
     layout="wide",
 )
@@ -78,19 +78,36 @@ st.markdown(
         .main-title {
             font-size: 38px;
             font-weight: 800;
-            margin-bottom: 2px;
+            color: #1E293B;
+            margin-bottom: 4px;
         }
         .subtitle {
-            font-size: 17px;
-            color: #777;
-            margin-bottom: 25px;
+            font-size: 18px;
+            color: #64748B;
+            margin-bottom: 24px;
         }
-        .meta-box {
-            background-color: #f8f9fa;
-            border-radius: 8px;
-            padding: 12px 18px;
-            border-left: 4px solid #ff4b4b;
+        .info-card {
+            background-color: #F8FAFC;
+            border: 1px solid #E2E8F0;
+            border-radius: 10px;
+            padding: 16px 20px;
+            margin-top: 15px;
             margin-bottom: 20px;
+        }
+        .info-header {
+            font-size: 16px;
+            font-weight: 700;
+            color: #0F172A;
+            margin-bottom: 10px;
+        }
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+            background-color: #E0E7FF;
+            color: #3730A3;
         }
     </style>
     """,
@@ -107,13 +124,14 @@ def initialize_session_state():
         "vector_store": None,
         "retriever": None,
         "video_processed": False,
-        "source_type": None,       # 'YouTube' or 'Uploaded Video'
-        "video_metadata": {},      # title, duration, author/filename, etc.
+        "source_type": None,              # 'YouTube' or 'Uploaded Video'
+        "video_metadata": {},             # title, duration, author, url/filename, etc.
         "transcript_text": "",
         "transcript_source": "",
         "transcript_language": "",
         "chunk_count": 0,
-        "processed_identifier": "",
+        "processed_identifier": "",       # video_id or sha256
+        "processed_cache": {},            # identifier -> cached pipeline dict
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -153,6 +171,9 @@ def extract_video_id(value: str) -> str:
     raise ValueError(
         "Invalid YouTube URL or ID. Supported formats include youtube.com/watch?v=..., youtu.be/..., and youtube.com/shorts/..."
     )
+
+def compute_file_sha256(file_bytes: bytes) -> str:
+    return hashlib.sha256(file_bytes).hexdigest()
 
 # ============================================================
 # HUGGING FACE EMBEDDINGS & LLM
@@ -267,7 +288,8 @@ def extract_audio_from_youtube(url_or_id: str) -> Tuple[str, str, Dict[str, Any]
             info = ydl.extract_info(url, download=True)
     except Exception as exc:
         shutil.rmtree(temp_dir, ignore_errors=True)
-        raise RuntimeError(f"Failed to download audio with yt-dlp: {exc}") from exc
+        safe_err = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(exc))
+        raise RuntimeError(f"Failed to download audio with yt-dlp: {safe_err}") from exc
 
     audio_path = os.path.join(temp_dir, f"{video_id}.mp3")
     if not os.path.exists(audio_path):
@@ -276,7 +298,7 @@ def extract_audio_from_youtube(url_or_id: str) -> Tuple[str, str, Dict[str, Any]
             audio_path = candidates[0]
         else:
             shutil.rmtree(temp_dir, ignore_errors=True)
-            raise RuntimeError("Audio extraction completed but output file not found.")
+            raise RuntimeError("Audio extraction completed but output audio file was not found.")
 
     metadata = {
         "id": video_id,
@@ -318,12 +340,13 @@ def extract_audio_from_video_file(uploaded_file) -> Tuple[str, str, Dict[str, An
 
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if res.returncode != 0 or not os.path.exists(audio_path):
-        err_msg = res.stderr.decode("utf-8", errors="ignore")[-400:]
+        err_msg = res.stderr.decode("utf-8", errors="ignore")[-300:]
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise RuntimeError(f"Failed to extract audio using imageio-ffmpeg: {err_msg}")
 
     metadata = {
         "filename": orig_name,
+        "title": orig_name,
         "size_mb": round(uploaded_file.size / (1024 * 1024), 2),
         "type": uploaded_file.type or "video",
     }
@@ -333,9 +356,10 @@ def extract_audio_from_video_file(uploaded_file) -> Tuple[str, str, Dict[str, An
 # TRANSCRIPTION: WHISPER & FALLBACK
 # ============================================================
 
-def transcribe_with_whisper(audio_path: str) -> str:
+def transcribe_with_whisper(audio_path: str, max_retries: int = 3) -> str:
     """
-    Performs real speech-to-text using Hugging Face InferenceClient with openai/whisper-large-v3.
+    Performs speech-to-text using Hugging Face InferenceClient with openai/whisper-large-v3.
+    Includes automated retry for transient network hiccups.
     """
     require_hf_token()
     if not os.path.exists(audio_path):
@@ -345,25 +369,32 @@ def transcribe_with_whisper(audio_path: str) -> str:
         audio_bytes = f.read()
 
     client = InferenceClient(token=HF_TOKEN)
-    try:
-        response = client.automatic_speech_recognition(
-            audio=audio_bytes,
-            model=WHISPER_MODEL,
-        )
-    except Exception as exc:
-        raise RuntimeError(f"Hugging Face Whisper API failed: {exc}") from exc
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.automatic_speech_recognition(
+                audio=audio_bytes,
+                model=WHISPER_MODEL,
+            )
+            if hasattr(response, "text"):
+                transcript = response.text
+            elif isinstance(response, dict):
+                transcript = response.get("text", "")
+            else:
+                transcript = str(response)
 
-    if hasattr(response, "text"):
-        transcript = response.text
-    elif isinstance(response, dict):
-        transcript = response.get("text", "")
-    else:
-        transcript = str(response)
+            transcript = transcript.strip()
+            if not transcript:
+                raise ValueError("Whisper returned an empty transcript.")
+            return transcript
+        except Exception as exc:
+            last_err = exc
+            if attempt < max_retries:
+                time.sleep(2 * attempt)
+                continue
 
-    transcript = transcript.strip()
-    if not transcript:
-        raise ValueError("Whisper returned an empty transcript.")
-    return transcript
+    safe_err = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(last_err))
+    raise RuntimeError(f"Hugging Face Whisper API failed: {safe_err}") from last_err
 
 
 def fetch_fallback_youtube_transcript(video_id: str, preferred_languages: Optional[List[str]] = None) -> str:
@@ -395,7 +426,8 @@ def fetch_fallback_youtube_transcript(video_id: str, preferred_languages: Option
             except Exception:
                 continue
     except Exception as exc:
-        raise RuntimeError(f"YouTube transcript fallback also failed: {exc}") from exc
+        safe_err = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(exc))
+        raise RuntimeError(f"YouTube transcript fallback also failed: {safe_err}") from exc
 
     raise RuntimeError("Could not retrieve transcript from YouTube.")
 
@@ -492,9 +524,16 @@ def generate_answer(context: str, question: str) -> str:
 
     return answer_clean
 
-def run_unified_rag_pipeline(transcript: str, source_name: str, source_type: str, metadata: Dict[str, Any]):
+def run_unified_rag_pipeline(
+    transcript: str,
+    source_name: str,
+    source_type: str,
+    metadata: Dict[str, Any],
+    identifier: str
+):
     """
     Shared RAG processor for both YouTube URLs and Uploaded Video files.
+    Clears previous video state cleanly to prevent transcript mixing.
     """
     chunks = split_text(transcript)
     if not chunks:
@@ -503,6 +542,7 @@ def run_unified_rag_pipeline(transcript: str, source_name: str, source_type: str
     vector_store = create_vector_store(chunks)
     retriever = create_retriever(vector_store)
 
+    # Clean switch to new video
     st.session_state.vector_store = vector_store
     st.session_state.retriever = retriever
     st.session_state.video_processed = True
@@ -511,7 +551,19 @@ def run_unified_rag_pipeline(transcript: str, source_name: str, source_type: str
     st.session_state.transcript_text = transcript
     st.session_state.transcript_source = source_name
     st.session_state.chunk_count = len(chunks)
-    st.session_state.messages = []
+    st.session_state.processed_identifier = identifier
+    st.session_state.messages = []  # Reset conversation for new video
+
+    # Cache for duplicate prevention
+    st.session_state.processed_cache[identifier] = {
+        "vector_store": vector_store,
+        "retriever": retriever,
+        "source_type": source_type,
+        "video_metadata": metadata,
+        "transcript_text": transcript,
+        "transcript_source": source_name,
+        "chunk_count": len(chunks),
+    }
 
 # ============================================================
 # SIDEBAR
@@ -532,18 +584,20 @@ with st.sidebar:
     st.divider()
 
     if st.session_state.video_processed:
-        st.subheader("📹 Active Video Details")
+        st.subheader("📹 Active Video Summary")
         meta = st.session_state.video_metadata
+        st.write(f"**Title**: {meta.get('title', 'N/A')}")
+        st.write(f"**Source Type**: `{st.session_state.source_type}`")
         if st.session_state.source_type == "YouTube":
-            st.write(f"**Title**: {meta.get('title', 'N/A')}")
             st.write(f"**Author**: {meta.get('uploader', 'N/A')}")
             st.write(f"**Duration**: {meta.get('duration', 'N/A')} seconds")
         else:
             st.write(f"**Filename**: {meta.get('filename', 'N/A')}")
             st.write(f"**File Size**: {meta.get('size_mb', 'N/A')} MB")
 
-        st.write(f"**Source**: `{st.session_state.transcript_source}`")
-        st.write(f"**Chunks Created**: `{st.session_state.chunk_count}`")
+        st.write(f"**Transcription Source**: `{st.session_state.transcript_source}`")
+        st.write(f"**Chunks**: `{st.session_state.chunk_count}`")
+        st.write(f"**Vector Store**: `Active (FAISS)`")
         st.divider()
 
     col1, col2 = st.columns(2)
@@ -553,30 +607,42 @@ with st.sidebar:
             st.rerun()
     with col2:
         if st.button("🔄 Reset All", use_container_width=True):
-            for k in ["messages", "vector_store", "retriever", "video_processed", "video_metadata", "transcript_text", "transcript_source", "chunk_count", "processed_identifier"]:
-                st.session_state[k] = [] if k == "messages" else (None if k in ["vector_store", "retriever"] else False if k == "video_processed" else ({} if k == "video_metadata" else (0 if k == "chunk_count" else "")))
+            for k in [
+                "messages", "vector_store", "retriever", "video_processed",
+                "video_metadata", "transcript_text", "transcript_source",
+                "chunk_count", "processed_identifier", "processed_cache"
+            ]:
+                st.session_state[k] = [] if k in ["messages", "processed_cache"] else (
+                    None if k in ["vector_store", "retriever"] else (
+                        False if k == "video_processed" else (
+                            {} if k in ["video_metadata", "processed_cache"] else (
+                                0 if k == "chunk_count" else ""
+                            )
+                        )
+                    )
+                )
             st.rerun()
 
 # ============================================================
 # MAIN UI
 # ============================================================
 
-st.markdown('<div class="main-title">🎬 YouTube & Video RAG Chatbot</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Grounded video Q&A with Whisper large-v3 & FAISS Vector Store</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">YouTube & Video RAG AI</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Upload a video or paste a YouTube URL and ask questions about its content.</div>', unsafe_allow_html=True)
 
 if not HF_TOKEN:
     st.warning("⚠️ Hugging Face token is missing. Please add `HF_TOKEN` to your `.env` file.")
 
-tab_yt, tab_upload = st.tabs(["📺 YouTube Video", "📁 Upload Video File"])
+tab_yt, tab_upload = st.tabs(["📺 YouTube Video", "📁 Upload Video"])
 
 # TAB 1: YOUTUBE INGESTION
 with tab_yt:
     yt_url = st.text_input(
-        "Enter YouTube Video URL or ID",
+        "YouTube Video URL or ID",
         placeholder="e.g. https://www.youtube.com/watch?v=jNQXAC9IVRw or youtu.be/...",
         key="yt_input_url",
     )
-    process_yt = st.button("🚀 Process YouTube Video", type="primary", key="btn_process_yt")
+    process_yt = st.button("🚀 Process Video", type="primary", key="btn_process_yt")
 
     if process_yt:
         if not yt_url.strip():
@@ -584,36 +650,61 @@ with tab_yt:
         else:
             try:
                 vid_id = extract_video_id(yt_url)
-                with st.status("Processing YouTube Video...", expanded=True) as status:
-                    st.write("1️⃣ Extracting audio stream via yt-dlp...")
-                    audio_path, temp_dir, meta = extract_audio_from_youtube(yt_url)
 
-                    transcript = None
-                    source_used = None
-
-                    try:
-                        st.write(f"2️⃣ Transcribing audio via Hugging Face `{WHISPER_MODEL}`...")
-                        transcript = transcribe_with_whisper(audio_path)
-                        source_used = f"Whisper ({WHISPER_MODEL})"
-                    except Exception as whisper_err:
-                        st.warning(f"Whisper API note: {whisper_err}. Attempting YouTube subtitle fallback...")
-                        try:
-                            transcript = fetch_fallback_youtube_transcript(vid_id)
-                            source_used = "youtube_transcript_api (fallback)"
-                        except Exception as fb_err:
-                            raise RuntimeError(f"Both Whisper and YouTube transcript fallback failed.\nWhisper error: {whisper_err}\nFallback error: {fb_err}")
-                    finally:
-                        shutil.rmtree(temp_dir, ignore_errors=True)
-
-                    st.write("3️⃣ Splitting transcript into chunks & generating multilingual embeddings...")
-                    st.write("4️⃣ Indexing in-memory FAISS vector store...")
-                    run_unified_rag_pipeline(transcript, source_used, "YouTube", meta)
+                # Duplicate check
+                if (
+                    st.session_state.video_processed
+                    and st.session_state.processed_identifier == vid_id
+                    and st.session_state.vector_store is not None
+                ):
+                    st.info("ℹ️ This YouTube video is already processed and ready for questions below!")
+                elif vid_id in st.session_state.processed_cache:
+                    cached = st.session_state.processed_cache[vid_id]
+                    st.session_state.vector_store = cached["vector_store"]
+                    st.session_state.retriever = cached["retriever"]
+                    st.session_state.video_processed = True
+                    st.session_state.source_type = cached["source_type"]
+                    st.session_state.video_metadata = cached["video_metadata"]
+                    st.session_state.transcript_text = cached["transcript_text"]
+                    st.session_state.transcript_source = cached["transcript_source"]
+                    st.session_state.chunk_count = cached["chunk_count"]
                     st.session_state.processed_identifier = vid_id
+                    st.session_state.messages = []
+                    st.success("✅ Loaded from session cache! Video is ready.")
+                else:
+                    with st.status("Processing Video...", expanded=True) as status:
+                        st.write("Step 1/5: Downloading video audio...")
+                        audio_path, temp_dir, meta = extract_audio_from_youtube(yt_url)
 
-                    status.update(label="✅ YouTube video processed and indexed!", state="complete")
-                st.success(f"Ready! Transcribed via **{source_used}** ({len(transcript)} chars, {st.session_state.chunk_count} chunks).")
+                        st.write("Step 2/5: Extracting audio...")
+                        # Audio already extracted to audio_path via yt-dlp postprocessor
+
+                        transcript = None
+                        source_used = None
+
+                        try:
+                            st.write(f"Step 3/5: Transcribing with Whisper Large v3 (`{WHISPER_MODEL}`)...")
+                            transcript = transcribe_with_whisper(audio_path)
+                            source_used = f"Whisper ({WHISPER_MODEL})"
+                        except Exception as whisper_err:
+                            st.warning(f"Whisper API notice: {whisper_err}. Attempting YouTube transcript fallback...")
+                            try:
+                                transcript = fetch_fallback_youtube_transcript(vid_id)
+                                source_used = "youtube_transcript_api (fallback)"
+                            except Exception as fb_err:
+                                raise RuntimeError(f"Both Whisper and YouTube transcript fallback failed.\nWhisper: {whisper_err}\nFallback: {fb_err}")
+                        finally:
+                            shutil.rmtree(temp_dir, ignore_errors=True)
+
+                        st.write("Step 4/5: Creating embeddings...")
+                        st.write("Step 5/5: Building FAISS knowledge base...")
+                        run_unified_rag_pipeline(transcript, source_used, "YouTube", meta, vid_id)
+
+                        status.update(label="✅ Video processed successfully.", state="complete")
+                    st.success("✅ Video processed successfully.")
             except Exception as e:
-                st.error(f"Error processing YouTube video: {e}")
+                safe_msg = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(e))
+                st.error(f"Error processing YouTube video: {safe_msg}")
 
 # TAB 2: UPLOADED VIDEO INGESTION
 with tab_upload:
@@ -622,59 +713,110 @@ with tab_upload:
         type=["mp4", "mov", "mkv", "avi", "webm"],
         key="uploaded_file_input",
     )
-    process_upload = st.button("🚀 Process Uploaded Video", type="primary", key="btn_process_upload")
+    process_upload = st.button("🚀 Process Video", type="primary", key="btn_process_upload")
 
     if process_upload:
         if not uploaded_file:
-            st.error("Please upload a video file first.")
+            st.error("Please select a video file to upload first.")
         else:
             try:
-                with st.status("Processing Uploaded Video...", expanded=True) as status:
-                    st.write("1️⃣ Extracting audio using bundled imageio-ffmpeg...")
-                    audio_path, temp_dir, meta = extract_audio_from_video_file(uploaded_file)
+                file_bytes = uploaded_file.getvalue()
+                file_hash = compute_file_sha256(file_bytes)
 
-                    try:
-                        st.write(f"2️⃣ Transcribing audio via Hugging Face `{WHISPER_MODEL}`...")
-                        transcript = transcribe_with_whisper(audio_path)
-                        source_used = f"Whisper ({WHISPER_MODEL})"
-                    finally:
-                        shutil.rmtree(temp_dir, ignore_errors=True)
+                # Duplicate check
+                if (
+                    st.session_state.video_processed
+                    and st.session_state.processed_identifier == file_hash
+                    and st.session_state.vector_store is not None
+                ):
+                    st.info("ℹ️ This uploaded video is already processed and ready for questions below!")
+                elif file_hash in st.session_state.processed_cache:
+                    cached = st.session_state.processed_cache[file_hash]
+                    st.session_state.vector_store = cached["vector_store"]
+                    st.session_state.retriever = cached["retriever"]
+                    st.session_state.video_processed = True
+                    st.session_state.source_type = cached["source_type"]
+                    st.session_state.video_metadata = cached["video_metadata"]
+                    st.session_state.transcript_text = cached["transcript_text"]
+                    st.session_state.transcript_source = cached["transcript_source"]
+                    st.session_state.chunk_count = cached["chunk_count"]
+                    st.session_state.processed_identifier = file_hash
+                    st.session_state.messages = []
+                    st.success("✅ Loaded from session cache! Video is ready.")
+                else:
+                    with st.status("Processing Video...", expanded=True) as status:
+                        st.write("Step 1/5: Reading uploaded video...")
+                        # File read into buffer
 
-                    st.write("3️⃣ Splitting transcript into chunks & generating multilingual embeddings...")
-                    st.write("4️⃣ Indexing in-memory FAISS vector store...")
-                    run_unified_rag_pipeline(transcript, source_used, "Uploaded Video", meta)
-                    st.session_state.processed_identifier = uploaded_file.name
+                        st.write("Step 2/5: Extracting audio...")
+                        audio_path, temp_dir, meta = extract_audio_from_video_file(uploaded_file)
 
-                    status.update(label="✅ Uploaded video processed and indexed!", state="complete")
-                st.success(f"Ready! Transcribed via **{source_used}** ({len(transcript)} chars, {st.session_state.chunk_count} chunks).")
+                        try:
+                            st.write(f"Step 3/5: Transcribing with Whisper Large v3 (`{WHISPER_MODEL}`)...")
+                            transcript = transcribe_with_whisper(audio_path)
+                            source_used = f"Whisper ({WHISPER_MODEL})"
+                        finally:
+                            shutil.rmtree(temp_dir, ignore_errors=True)
+
+                        st.write("Step 4/5: Creating embeddings...")
+                        st.write("Step 5/5: Building FAISS knowledge base...")
+                        run_unified_rag_pipeline(transcript, source_used, "Uploaded Video", meta, file_hash)
+
+                        status.update(label="✅ Video processed successfully.", state="complete")
+                    st.success("✅ Video processed successfully.")
             except Exception as e:
-                st.error(f"Error processing uploaded video: {e}")
+                safe_msg = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(e))
+                st.error(f"Error processing uploaded video: {safe_msg}")
 
 # ============================================================
-# CHAT INTERFACE
+# PHASE 4: VIDEO INFORMATION CARD
+# ============================================================
+
+if st.session_state.video_processed:
+    meta = st.session_state.video_metadata
+    st.markdown(
+        f"""
+        <div class="info-card">
+            <div class="info-header">📹 Video Information</div>
+            <b>Video title:</b> {meta.get('title', 'N/A')}<br>
+            <b>Source type:</b> <span class="badge">{st.session_state.source_type}</span><br>
+            {f"<b>Channel / Author:</b> {meta.get('uploader', 'N/A')}<br>" if st.session_state.source_type == 'YouTube' else ""}
+            {f"<b>YouTube URL:</b> <a href='{meta.get('url', '#')}' target='_blank'>{meta.get('url', 'N/A')}</a><br>" if st.session_state.source_type == 'YouTube' else ""}
+            {f"<b>File name:</b> {meta.get('filename', 'N/A')}<br>" if st.session_state.source_type != 'YouTube' else ""}
+            <b>Duration:</b> {meta.get('duration', 'N/A')}s<br>
+            <b>Transcript length:</b> {len(st.session_state.transcript_text):,} characters<br>
+            <b>Number of chunks:</b> {st.session_state.chunk_count}<br>
+            <b>Vector index status:</b> <span style="color:#16A34A; font-weight:600;">Active (In-Memory FAISS)</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# ============================================================
+# CHAT INTERFACE & SOURCES
 # ============================================================
 
 st.divider()
-st.subheader("💬 Ask Questions About the Video")
+st.subheader("💬 Ask Questions About This Video")
 
 if not st.session_state.video_processed:
-    st.info("👈 Please process a YouTube video or upload a video file above to begin chatting!")
+    st.info("👈 Please process a YouTube video or upload a video file above to start asking questions!")
 else:
-    meta = st.session_state.video_metadata
-    label = meta.get("title") or meta.get("filename") or "Video"
-    st.caption(f"Currently querying: **{label}** (Source: {st.session_state.transcript_source})")
-
     # Render previous conversation
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
             if msg.get("sources"):
-                with st.expander("🔍 Retrieved Video Context Chunks"):
-                    for idx, chunk in enumerate(msg["sources"], 1):
-                        st.markdown(f"**Chunk {idx}:**\n> {chunk}")
+                with st.expander("📚 Sources / Retrieved Context"):
+                    for idx, s in enumerate(msg["sources"], 1):
+                        st.markdown(f"**Source:** {s.get('source', 'Video Transcript')}")
+                        st.markdown(f"**Timestamp:** {s.get('timestamp', 'N/A (Full Clip Transcript)')}")
+                        st.markdown(f"**Relevant Text:**\n> {s.get('text', '')}")
+                        if idx < len(msg["sources"]):
+                            st.divider()
 
     # Handle user query
-    if user_query := st.chat_input("Ask a question grounded in the video..."):
+    if user_query := st.chat_input("What are the main points discussed in this video?"):
         st.session_state.messages.append({"role": "user", "content": user_query})
         with st.chat_message("user"):
             st.write(user_query)
@@ -689,13 +831,27 @@ else:
                 answer = generate_answer(context_str, user_query)
                 st.write(answer)
 
-                if context_chunks:
-                    with st.expander("🔍 Retrieved Video Context Chunks"):
-                        for idx, chunk in enumerate(context_chunks, 1):
-                            st.markdown(f"**Chunk {idx}:**\n> {chunk}")
+                sources_payload = []
+                if "couldn't find the answer" not in answer.lower():
+                    meta_title = st.session_state.video_metadata.get("title") or "Video Transcript"
+                    for doc in docs:
+                        sources_payload.append({
+                            "source": meta_title,
+                            "timestamp": "N/A (Full Clip Transcript)",
+                            "text": doc.page_content,
+                        })
+
+                    if sources_payload:
+                        with st.expander("📚 Sources / Retrieved Context"):
+                            for idx, s in enumerate(sources_payload, 1):
+                                st.markdown(f"**Source:** {s['source']}")
+                                st.markdown(f"**Timestamp:** {s['timestamp']}")
+                                st.markdown(f"**Relevant Text:**\n> {s['text']}")
+                                if idx < len(sources_payload):
+                                    st.divider()
 
         st.session_state.messages.append({
             "role": "assistant",
             "content": answer,
-            "sources": context_chunks if "couldn't find the answer" not in answer.lower() else []
+            "sources": sources_payload,
         })
