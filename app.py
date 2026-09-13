@@ -73,6 +73,7 @@ LOCAL_MODEL_PATH = get_secret(
 )
 VISION_MODEL_NAME = get_secret("VISION_MODEL_NAME", "Qwen/Qwen2.5-VL-3B-Instruct")
 FRAME_INTERVAL_SECONDS = int(get_secret("FRAME_INTERVAL_SECONDS", "5") or 5)
+FORCE_LOCAL_VISION = (get_secret("FORCE_LOCAL_VISION", "0") or "0").lower() in ("1", "true", "yes")
 
 def render_html(html_str: str) -> None:
     """Render HTML safely without Markdown treating indented lines as code blocks."""
@@ -636,7 +637,8 @@ def analyze_frame_visual(image_path: str, timestamp_str: str) -> str:
     local visual scene analyzer fallback to guarantee 0 crashes.
     """
     # Strategy 1: Cloud Vision-Language Model (VLM)
-    if HF_TOKEN:
+    force_local_vision = FORCE_LOCAL_VISION or os.getenv("FORCE_LOCAL_VISION", "").strip().lower() in ("1", "true", "yes")
+    if HF_TOKEN and not force_local_vision:
         try:
             with open(image_path, "rb") as f:
                 img_bytes = f.read()
@@ -669,6 +671,8 @@ def analyze_frame_visual(image_path: str, timestamp_str: str) -> str:
         except Exception as vlm_err:
             safe_err = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(vlm_err))
             print(f"[VISION] Cloud VLM ({VISION_MODEL_NAME}) unavailable: {safe_err}. Using local visual analysis.")
+    elif force_local_vision:
+        print("[VISION] Cloud VLM bypassed (FORCE_LOCAL_VISION=1). Using local visual analysis.")
 
     # Strategy 2: Resilient Local Visual Analyzer (real image statistics, dominant color, texture, layout)
     try:
@@ -764,13 +768,43 @@ def classify_question_intent(question: str) -> str:
     return "multimodal"
 
 
+def extract_query_timestamp_seconds(query: str) -> Optional[float]:
+    """
+    Extracts explicit timestamp requests from user query.
+    Examples:
+      - "at 01:20" -> 80.0
+      - "around 2 minutes" -> 120.0
+      - "at 45 seconds" -> 45.0
+      - "at 85s" -> 85.0
+    """
+    q = query.lower()
+    m_colon = re.search(r"\b(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\b", q)
+    if m_colon:
+        hrs = int(m_colon.group(1) or 0)
+        mins = int(m_colon.group(2) or 0)
+        secs = int(m_colon.group(3) or 0)
+        return float(hrs * 3600 + mins * 60 + secs)
+
+    m_min = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:min|minute|minutes)\b", q)
+    if m_min:
+        return float(m_min.group(1)) * 60.0
+
+    m_sec = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:sec|second|seconds|s)\b", q)
+    if m_sec:
+        return float(m_sec.group(1))
+
+    return None
+
+
 def retrieve_multimodal_context(
     question: str,
     text_retriever: Optional[Any],
-    visual_retriever: Optional[Any]
+    visual_retriever: Optional[Any],
+    visual_vector_store: Optional[Any] = None
 ) -> Tuple[str, List[Any], str]:
-    """Retrieves relevant transcript and visual evidence based on question intent."""
+    """Retrieves relevant transcript and visual evidence based on question intent and timestamps."""
     intent = classify_question_intent(question)
+    target_sec = extract_query_timestamp_seconds(question)
     transcript_docs = []
     visual_docs = []
 
@@ -787,6 +821,23 @@ def retrieve_multimodal_context(
         except Exception as e:
             print(f"[RAG] Visual retrieval error: {e}")
             visual_docs = []
+
+    # Timestamp-aware visual frame prioritization (Section 6)
+    if target_sec is not None and visual_vector_store is not None:
+        try:
+            all_v_docs = list(getattr(visual_vector_store.docstore, "_dict", {}).values())
+            time_matched = [
+                d for d in all_v_docs
+                if abs(d.metadata.get("timestamp_sec", 999999) - target_sec) <= 15.0
+            ]
+            if time_matched:
+                time_matched.sort(key=lambda d: abs(d.metadata.get("timestamp_sec", 0) - target_sec))
+                existing_contents = {d.page_content for d in visual_docs}
+                extra_docs = [d for d in time_matched if d.page_content not in existing_contents]
+                visual_docs = (extra_docs + visual_docs)[:6]
+                print(f"[RAG] Timestamp alignment boosted {len(extra_docs)} frame(s) around {target_sec}s")
+        except Exception as e:
+            print(f"[RAG] Timestamp alignment error: {e}")
 
     if not visual_docs and not transcript_docs:
         if text_retriever is not None:
@@ -1645,7 +1696,10 @@ if st.session_state.video_processed:
                 visual_retriever = st.session_state.get("visual_retriever")
 
                 context_str, docs, intent = retrieve_multimodal_context(
-                    user_query, text_retriever, visual_retriever
+                    user_query,
+                    text_retriever,
+                    visual_retriever,
+                    visual_vector_store=st.session_state.get("visual_vector_store")
                 )
 
                 print("-" * 50)

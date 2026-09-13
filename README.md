@@ -15,46 +15,33 @@ An intelligent Multimodal Video Question-Answering Chatbot built with Streamlit,
 ## System Architecture
 
 ```
-USER
- |
- | YouTube URL / Local Video
- v
-VIDEO INGESTION
- |
- +------------------------+
- |                        |
- v                        v
-AUDIO EXTRACTION       FRAME EXTRACTION
- |                        |
- v                        v
-WHISPER              QWEN2.5-VL
- |                        |
- v                        v
-TRANSCRIPT             VISUAL
-CHUNKS               DESCRIPTIONS
- |                        |
- v                        v
-TEXT EMBEDDINGS       VISUAL EMBEDDINGS
- |                        |
- v                        v
-TEXT FAISS            VISUAL FAISS
- |                        |
- +-----------+------------+
-             |
-             v
-      QUESTION ROUTER
-             |
-       +-----+-----+
-       |     |     |
-      TEXT VISUAL MULTIMODAL
-       |     |     |
-       +-----+-----+
-             |
-             v
-       GROUNDED LLM
-             |
-             v
-      FINAL ANSWER
+                 VIDEO / YOUTUBE
+                       |
+             +---------+---------+
+             |                   |
+           AUDIO               FRAMES
+             |                   |
+          WHISPER          QWEN2.5-VL
+             |                   |
+       TRANSCRIPT          VISUAL DESCRIPTIONS
+             |                   |
+     Transcript FAISS      Visual FAISS
+             |                   |
+             +---------+---------+
+                       |
+               QUESTION ROUTER
+                       |
+          +------------+------------+
+          |            |            |
+         TEXT        VISUAL     MULTIMODAL
+          |            |            |
+       Text RAG     Visual RAG   Both RAG
+          |            |            |
+          +------------+------------+
+                       |
+                    QWEN LLM
+                       |
+                 FINAL ANSWER
 ```
 
 ### Retrieval & Question Routing
