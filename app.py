@@ -195,7 +195,8 @@ def initialize_session_state():
         "retriever": None,
         "video_processed": False,
         "source_type": None,              # 'YouTube' or 'Uploaded Video'
-        "video_metadata": {},             # title, duration, author, url/filename, etc.
+        "video_metadata": {},
+        "video_playback_source": None,             # title, duration, author, url/filename, etc.
         "transcript_text": "",
         "transcript_source": "",
         "transcript_language": "",
@@ -598,7 +599,8 @@ def run_unified_rag_pipeline(
     source_name: str,
     source_type: str,
     metadata: Dict[str, Any],
-    identifier: str
+    identifier: str,
+    playback_source: Optional[Any] = None
 ):
     """
     Shared RAG processor for both YouTube URLs and Uploaded Video files.
@@ -617,6 +619,7 @@ def run_unified_rag_pipeline(
     st.session_state.video_processed = True
     st.session_state.source_type = source_type
     st.session_state.video_metadata = metadata
+    st.session_state.video_playback_source = playback_source
     st.session_state.transcript_text = transcript
     st.session_state.transcript_source = source_name
     st.session_state.chunk_count = len(chunks)
@@ -629,6 +632,7 @@ def run_unified_rag_pipeline(
         "retriever": retriever,
         "source_type": source_type,
         "video_metadata": metadata,
+        "video_playback_source": playback_source,
         "transcript_text": transcript,
         "transcript_source": source_name,
         "chunk_count": len(chunks),
@@ -688,7 +692,7 @@ with st.sidebar:
             for k in [
                 "messages", "vector_store", "retriever", "video_processed",
                 "video_metadata", "transcript_text", "transcript_source",
-                "chunk_count", "processed_identifier", "processed_cache"
+                "chunk_count", "processed_identifier", "processed_cache", "video_playback_source"
             ]:
                 st.session_state[k] = [] if k in ["messages", "processed_cache"] else (
                     None if k in ["vector_store", "retriever"] else (
@@ -767,6 +771,7 @@ with tab_yt:
                     st.session_state.video_processed = True
                     st.session_state.source_type = cached["source_type"]
                     st.session_state.video_metadata = cached["video_metadata"]
+                    st.session_state.video_playback_source = cached.get("video_playback_source", f"https://www.youtube.com/watch?v={vid_id}")
                     st.session_state.transcript_text = cached["transcript_text"]
                     st.session_state.transcript_source = cached["transcript_source"]
                     st.session_state.chunk_count = cached["chunk_count"]
@@ -798,7 +803,7 @@ with tab_yt:
                         st.write("03 Text Chunking")
                         st.write("04 Embedding Generation")
                         st.write("05 FAISS Indexing")
-                        run_unified_rag_pipeline(transcript, source_used, "YouTube", meta, vid_id)
+                        run_unified_rag_pipeline(transcript, source_used, "YouTube", meta, vid_id, playback_source=f"https://www.youtube.com/watch?v={vid_id}")
 
                         status.update(label="✓ Video successfully processed", state="complete", expanded=False)
             except Exception as e:
@@ -838,6 +843,7 @@ with tab_upload:
                     st.session_state.video_processed = True
                     st.session_state.source_type = cached["source_type"]
                     st.session_state.video_metadata = cached["video_metadata"]
+                    st.session_state.video_playback_source = cached.get("video_playback_source")
                     st.session_state.transcript_text = cached["transcript_text"]
                     st.session_state.transcript_source = cached["transcript_source"]
                     st.session_state.chunk_count = cached["chunk_count"]
@@ -859,12 +865,28 @@ with tab_upload:
                         st.write("03 Text Chunking")
                         st.write("04 Embedding Generation")
                         st.write("05 FAISS Indexing")
-                        run_unified_rag_pipeline(transcript, source_used, "Uploaded Video", meta, file_hash)
+                        run_unified_rag_pipeline(transcript, source_used, "Uploaded Video", meta, file_hash, playback_source=file_bytes)
 
                         status.update(label="✓ Video successfully processed", state="complete", expanded=False)
             except Exception as e:
                 safe_msg = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(e))
                 st.error(f"❌ Unable to process video: {safe_msg}")
+
+# ============================================================
+# VIDEO PREVIEW (AFTER PROCESSING)
+# ============================================================
+
+if st.session_state.video_processed:
+    st.markdown("<div style='margin-top: 20px;'></div>", unsafe_allow_html=True)
+    st.subheader("🎥 Video Preview")
+    playback_source = st.session_state.get("video_playback_source")
+    try:
+        if playback_source:
+            st.video(playback_source)
+        else:
+            st.info("Video preview unavailable. You can still ask questions about the processed transcript.")
+    except Exception:
+        st.info("Video preview unavailable. You can still ask questions about the processed transcript.")
 
 # ============================================================
 # VIDEO INFORMATION CARD (AFTER PROCESSING)
