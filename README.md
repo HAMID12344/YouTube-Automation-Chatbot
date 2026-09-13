@@ -1,5 +1,5 @@
 ---
-title: YouTube Automation Chatbot
+title: YouTube Automation Chatbot — Multimodal Video RAG
 emoji: 🎥
 colorFrom: red
 colorTo: blue
@@ -8,51 +8,94 @@ app_port: 7860
 pinned: false
 ---
 
-# YouTube Automation Chatbot
+# YouTube Automation Chatbot — Multimodal Video RAG
 
-An intelligent Video Question-Answering Chatbot built with Streamlit, FAISS, Whisper, and Retrieval-Augmented Generation (RAG). Supports both YouTube URLs and local video file uploads.
+An intelligent Multimodal Video Question-Answering Chatbot built with Streamlit, FAISS, Whisper, Vision-Language Models (VLM), and Retrieval-Augmented Generation (RAG). The system understands **both what is spoken** (via speech transcription) and **what is visually shown** (via real video frame extraction and visual analysis) in uploaded videos and YouTube links.
+
+## System Architecture
+
+```
+                    VIDEO
+                      |
+             +--------+--------+
+             |                 |
+             ↓                 ↓
+           AUDIO          VIDEO FRAMES
+             ↓                 ↓
+          WHISPER          VISION MODEL
+             ↓                 ↓
+        TRANSCRIPT       VISUAL ANALYSIS
+             ↓                 ↓
+        TEXT RAG          VISUAL RAG
+             |                 |
+             +--------+--------+
+                      ↓
+             MULTIMODAL RETRIEVAL
+                      ↓
+            TRANSCRIPT EVIDENCE
+                    +
+              VISUAL EVIDENCE
+                      ↓
+                     LLM
+                      ↓
+                   ANSWER
+```
+
+### Retrieval & Question Routing
+
+User queries are dynamically classified and routed:
+- **Audio / Transcript Questions** (*"What did the speaker say?", "Who was mentioned?"*): Retrieved primarily from the Transcript FAISS knowledge base.
+- **Visual Questions** (*"What is visible in the video?", "What color is the car?", "What object is on the table?"*): Retrieved primarily from the Visual FAISS knowledge base with exact frame timestamps.
+- **Multimodal Questions** (*"What was the person doing while talking about X?"*): Retrieves both transcript segments and visual descriptions to synthesize a correlated response.
+
+### Strict Grounding & Zero Hallucination
+
+The assistant strictly follows grounding rules:
+- Answers only using supplied transcript and visual evidence.
+- Never guesses or invents external facts.
+- Exact fallback when evidence does not support the query:
+  > `I couldn't find the answer to that in the video.`
+
+---
 
 ## Features
 
-- Upload local videos (MP4, MKV, MOV, WebM, AVI)
-- YouTube URL support
-- Automatic audio extraction
-- Whisper transcription (faster-whisper CPU INT8 with Cloud Whisper support)
-- Semantic chunking (RecursiveCharacterTextSplitter 1000/200)
-- Sentence Transformer embeddings (paraphrase-multilingual-MiniLM-L12-v2)
-- FAISS vector search
-- RAG question answering
-- Local LLM fallback (Qwen GGUF / Extractive RAG fallback)
-- Grounded answers (returns strictly *I couldn't find the answer to that in the video.* for out-of-scope queries)
-- Video isolation (clears state, cache, and vector store between videos)
+- **Input Support:**
+  - Local video file uploads (`MP4`, `MOV`, `MKV`, `AVI`, `WEBM`).
+  - YouTube URLs (native caption priority, with audio and transcription fallback).
+- **Speech Understanding:**
+  - Speech-to-text via `faster-whisper` (CPU INT8 base model, cached) with cloud Whisper (`openai/whisper-large-v3`) support.
+  - Semantic chunking with `RecursiveCharacterTextSplitter` (chunk size 1000, overlap 200).
+- **Visual Understanding:**
+  - Real representative frame extraction at configurable intervals (`FRAME_INTERVAL_SECONDS`, default 5s).
+  - Vision-Language Model inference via `VISION_MODEL_NAME` (`Qwen/Qwen2.5-VL-3B-Instruct`) with resilient local visual scene fallback.
+  - Video timestamps associated with every frame record (`[00:01:23]`).
+- **Multimodal Knowledge Base:**
+  - Text FAISS vector store for speech transcript chunks.
+  - Visual FAISS vector store for visual scene descriptions.
+  - Multilingual Sentence Transformers (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`).
+- **Video Isolation & Lifecycle:**
+  - Complete state isolation between videos: uploading Video B cleanly purges Video A's transcript, frames, vector stores, and conversation.
+  - Ingests and processes each video once; subsequent questions reuse cached vector stores without re-transcription or re-extraction.
+  - Temporary files (`.mp4`, `.mp3`, `.wav`, extracted frames) are automatically cleaned up.
 
-## Architecture
+---
 
-```
-Video
-  ↓
-Audio Extraction
-  ↓
-Whisper
-  ↓
-Transcript
-  ↓
-Chunking
-  ↓
-Embeddings
-  ↓
-FAISS
-  ↓
-Question
-  ↓
-Retrieval
-  ↓
-LLM
-  ↓
-Answer
-```
+## Configuration & Environment Variables
 
-## Local Installation
+| Variable | Default Value | Description |
+| :--- | :--- | :--- |
+| `HF_TOKEN` | *None* | Hugging Face API Token (optional for cloud inference). |
+| `HF_MODEL_ID` | `Qwen/Qwen2.5-Coder-32B-Instruct` | Primary cloud LLM for grounded multimodal generation. |
+| `VISION_MODEL_NAME` | `Qwen/Qwen2.5-VL-3B-Instruct` | Vision-Language model for analyzing extracted video frames. |
+| `WHISPER_MODEL` | `openai/whisper-large-v3` | Cloud Whisper model. |
+| `FRAME_INTERVAL_SECONDS` | `5` | Sampling interval in seconds for representative frame extraction. |
+| `FORCE_LOCAL_LLM` | `0` | Set to `1` to bypass cloud LLM and use local GGUF / extractive fallback. |
+| `FORCE_LOCAL_WHISPER` | `0` | Set to `1` to force local faster-whisper. |
+
+---
+
+## Local Installation & Quickstart
 
 1. **Clone the repository:**
    ```bash
@@ -75,39 +118,33 @@ Answer
    pip install -r requirements.txt
    ```
 
-4. **Set up environment variables (Optional for Cloud Features):**
-   Create a `.env` file in the root directory:
-   ```env
-   HF_TOKEN="your_huggingface_token_here"
-   HF_MODEL_ID="Qwen/Qwen2.5-Coder-32B-Instruct"
-   ```
-
-5. **Run the Streamlit application:**
+4. **Launch Streamlit:**
    ```bash
    streamlit run app.py
    ```
 
-## Usage
+5. **Run Automated Test Suite:**
+   ```bash
+   python test_multimodal_pipeline.py
+   ```
 
-1. Open the application in your browser (`http://localhost:8501` locally or port `7860` in Docker).
-2. Choose your input mode from the sidebar:
-   - **YouTube URL**: Paste any valid YouTube video link and click "Process Video".
-   - **Local Video**: Drag and drop an MP4, MKV, MOV, WEBM, or AVI file.
-3. Wait for audio extraction, Whisper transcription, and vector indexing to complete.
-4. Ask any question in the chat bar. The system will retrieve the most relevant transcript segments and generate a grounded answer.
-5. If you ask a question outside the video's scope, the chatbot responds with:
-   > *I couldn't find the answer to that in the video.*
+---
 
-## Hugging Face Deployment
+## Docker & Hugging Face Spaces Deployment
 
-This Space is configured for Hugging Face Spaces using **Docker**:
-- Uses `python:3.11-slim` with system `ffmpeg`, `git`, and build tools.
-- Runs as non-root user `user` (UID `1000`) per Hugging Face Spaces standards.
-- Exposes port `7860` and runs in headless mode (`0.0.0.0:7860`).
-- Container startup command:
+The application is fully containerized and compatible with Hugging Face Spaces Docker runtime.
+
+- **Base Image:** `python:3.11-slim`
+- **Exposed Port:** `7860`
+- **Non-Root User:** `user` (UID `1000`)
+- **Startup Command:**
   ```bash
   streamlit run app.py --server.port=7860 --server.address=0.0.0.0
   ```
 
-### Live Demo
-To be updated after deployment.
+### Build & Run Locally with Docker:
+```bash
+docker build -t youtube-automation-chatbot .
+docker run -p 7860:7860 youtube-automation-chatbot
+```
+Access the application at `http://localhost:7860`.

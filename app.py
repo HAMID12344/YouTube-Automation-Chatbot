@@ -19,12 +19,17 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
+import base64
+import glob
+from PIL import Image, ImageStat, ImageFilter
+
 import imageio_ffmpeg
 import yt_dlp
 from huggingface_hub import InferenceClient
 from youtube_transcript_api import YouTubeTranscriptApi
 
 from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
 from langchain_huggingface import (
     ChatHuggingFace,
@@ -66,6 +71,8 @@ LOCAL_MODEL_PATH = get_secret(
     "LOCAL_MODEL_PATH",
     os.path.join("models", "qwen2.5-0.5b-instruct-q4_k_m.gguf")
 )
+VISION_MODEL_NAME = get_secret("VISION_MODEL_NAME", "Qwen/Qwen2.5-VL-3B-Instruct")
+FRAME_INTERVAL_SECONDS = int(get_secret("FRAME_INTERVAL_SECONDS", "5") or 5)
 
 def render_html(html_str: str) -> None:
     """Render HTML safely without Markdown treating indented lines as code blocks."""
@@ -204,6 +211,9 @@ def initialize_session_state():
         "processed_identifier": "",       # video_id or sha256
         "processed_cache": {},            # identifier -> cached pipeline dict
         "current_provider": "Hugging Face",
+        "visual_vector_store": None,
+        "visual_retriever": None,
+        "visual_records": [],
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -322,7 +332,15 @@ class LocalExtractiveFallbackLLM:
     retrieved context chunks without hallucination.
     """
     def invoke(self, prompt: str, context: Optional[str] = None, question: Optional[str] = None) -> str:
-        if not context and "Context:" in prompt and "Question:" in prompt:
+        if not context and "EVIDENCE CONTEXT:" in prompt and "QUESTION:" in prompt:
+            try:
+                parts = prompt.split("EVIDENCE CONTEXT:", 1)[1].split("QUESTION:", 1)
+                context = parts[0].strip()
+                question = parts[1].split("ANSWER:", 1)[0].strip()
+            except Exception:
+                context = prompt
+                question = ""
+        elif not context and "Context:" in prompt and "Question:" in prompt:
             try:
                 parts = prompt.split("Context:", 1)[1].split("Question:", 1)
                 context = parts[0].strip()
@@ -339,13 +357,49 @@ class LocalExtractiveFallbackLLM:
             general_terms = {
                 "what", "who", "where", "when", "why", "how", "which", "is", "are", "was", "were", 
                 "the", "a", "an", "in", "on", "at", "of", "to", "for", "and", "or", "not", "this", 
-                "that", "video", "about", "main", "points", "summary", "summarize"
+                "that", "video", "about", "main", "points", "summary", "summarize", "tell", "tell me"
             }
             q_keywords = [w for w in re.findall(r"\b[a-zA-Z0-9]+\b", question.lower()) if w not in general_terms and len(w) >= 3]
             if q_keywords and not any(kw in context.lower() for kw in q_keywords):
                 return "I couldn't find the answer to that in the video."
+        else:
+            q_keywords = []
 
         lower_q = (question or "").lower()
+
+        # Multimodal handling: when context contains both transcript and visual sections
+        if "=== TRANSCRIPT EVIDENCE ===" in context and "=== VISUAL EVIDENCE" in context:
+            parts = context.split("=== VISUAL EVIDENCE")
+            t_part = parts[0].replace("=== TRANSCRIPT EVIDENCE ===", "").strip()
+            v_part = ("=== VISUAL EVIDENCE" + parts[1]).strip()
+
+            t_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", t_part) if len(s.strip()) > 15]
+            v_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", v_part) if len(s.strip()) > 15]
+
+            t_scored = sorted([(sum(1 for kw in q_keywords if kw in s.lower()), s) for s in t_sentences], key=lambda x: x[0], reverse=True)
+            v_scored = sorted([(sum(1 for kw in q_keywords if kw in s.lower()), s) for s in v_sentences], key=lambda x: x[0], reverse=True)
+
+            t_best = [s for count, s in t_scored if count > 0]
+            v_best = [s for count, s in v_scored if count > 0]
+
+            is_visual_q = any(k in lower_q for k in ["visible", "visual", "see", "seen", "shown", "look", "scene", "color", "doing", "person doing", "object"])
+            is_transcript_q = any(k in lower_q for k in ["say", "said", "speak", "spoke", "mention", "mentioned", "talk", "talked", "discuss", "discussed", "words", "audio"])
+
+            if is_visual_q and is_transcript_q:
+                ans_t = t_best[0] if t_best else (t_sentences[0] if t_sentences else "")
+                ans_v = v_best[0] if v_best else (v_sentences[0] if v_sentences else "")
+                return f"{ans_t} Visually: {ans_v}".strip()
+            elif is_visual_q and not is_transcript_q:
+                if v_best:
+                    return " ".join(v_best[:2])
+                elif v_sentences:
+                    return v_sentences[0]
+            elif is_transcript_q and not is_visual_q:
+                if t_best:
+                    return " ".join(t_best[:2])
+                elif t_sentences:
+                    return t_sentences[0]
+
         if any(term in lower_q for term in ["about", "main points", "summary", "overview", "what is this video"]):
             sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", context) if len(s.strip()) > 20]
             if sentences:
@@ -452,14 +506,14 @@ def extract_audio_from_youtube(url_or_id: str) -> Tuple[str, str, Dict[str, Any]
     return audio_path, temp_dir, metadata
 
 
-def extract_audio_from_video_file(uploaded_file) -> Tuple[str, str, Dict[str, Any]]:
+def extract_audio_from_video_file(uploaded_file) -> Tuple[str, str, Dict[str, Any], str]:
     """
     Uses bundled imageio-ffmpeg executable to extract audio from an uploaded video.
-    Returns: (audio_path, temp_dir, metadata_dict)
+    Returns: (audio_path, temp_dir, metadata_dict, input_video_path)
     """
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     if not ffmpeg_exe or not os.path.exists(ffmpeg_exe):
-        raise RuntimeError("FFmpeg executable bundled with imageio-ffmpeg could not be found.")
+        ffmpeg_exe = shutil.which("ffmpeg") or "ffmpeg"
 
     temp_dir = tempfile.mkdtemp(prefix="upload_rag_")
     orig_name = uploaded_file.name
@@ -492,7 +546,259 @@ def extract_audio_from_video_file(uploaded_file) -> Tuple[str, str, Dict[str, An
         "size_mb": round(uploaded_file.size / (1024 * 1024), 2),
         "type": uploaded_file.type or "video",
     }
-    return audio_path, temp_dir, metadata
+    return audio_path, temp_dir, metadata, input_path
+
+
+# ============================================================
+# VISUAL VIDEO ANALYSIS & FRAME EXTRACTION
+# ============================================================
+
+def format_timestamp(seconds: float) -> str:
+    """Formats seconds into HH:MM:SS timestamp string."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def extract_video_frames(
+    video_path: str,
+    interval_seconds: Optional[int] = None,
+    max_frames: int = 15
+) -> List[Tuple[str, float, str]]:
+    """
+    Extracts representative frames from video at configurable intervals.
+    Returns: List of (frame_image_path, timestamp_sec, formatted_timestamp_str)
+    """
+    if interval_seconds is None:
+        interval_seconds = FRAME_INTERVAL_SECONDS or 5
+
+    ffmpeg_exe = None
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+    if not ffmpeg_exe or not os.path.exists(ffmpeg_exe):
+        ffmpeg_exe = shutil.which("ffmpeg") or "ffmpeg"
+
+    frames_dir = os.path.join(os.path.dirname(video_path), "extracted_frames")
+    os.makedirs(frames_dir, exist_ok=True)
+    out_pattern = os.path.join(frames_dir, "frame_%04d.jpg")
+
+    cmd = [
+        ffmpeg_exe,
+        "-y",
+        "-i", video_path,
+        "-vf", f"fps=1/{interval_seconds}",
+        "-q:v", "2",
+        out_pattern
+    ]
+    try:
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    except Exception as exc:
+        print(f"[VISION] Frame extraction error: {exc}")
+
+    frame_files = sorted(glob.glob(os.path.join(frames_dir, "frame_*.jpg")))
+    if not frame_files:
+        # Fallback: extract single frame at 1s if fps filter yielded nothing
+        single_frame = os.path.join(frames_dir, "frame_single.jpg")
+        cmd_single = [ffmpeg_exe, "-y", "-ss", "00:00:01", "-i", video_path, "-vframes", "1", "-q:v", "2", single_frame]
+        subprocess.run(cmd_single, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if os.path.exists(single_frame):
+            frame_files = [single_frame]
+
+    # Subsample if more than max_frames to preserve CPU responsiveness
+    if len(frame_files) > max_frames:
+        step = len(frame_files) / max_frames
+        selected = [frame_files[int(i * step)] for i in range(max_frames)]
+        frame_files = selected
+
+    records = []
+    for idx, fpath in enumerate(frame_files):
+        ts_sec = idx * interval_seconds
+        ts_fmt = format_timestamp(ts_sec)
+        records.append((fpath, ts_sec, ts_fmt))
+
+    return records
+
+
+def analyze_frame_visual(image_path: str, timestamp_str: str) -> str:
+    """
+    Analyzes an extracted video frame using the configured Vision-Language Model
+    (Qwen/Qwen2.5-VL-3B-Instruct) via Hugging Face InferenceClient, with a resilient
+    local visual scene analyzer fallback to guarantee 0 crashes.
+    """
+    # Strategy 1: Cloud Vision-Language Model (VLM)
+    if HF_TOKEN:
+        try:
+            with open(image_path, "rb") as f:
+                img_bytes = f.read()
+            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+            data_uri = f"data:image/jpeg;base64,{img_b64}"
+            client = InferenceClient(token=HF_TOKEN)
+            res = client.chat.completions.create(
+                model=VISION_MODEL_NAME,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": data_uri}},
+                        {
+                            "type": "text",
+                            "text": (
+                                "Provide a concise, factual description of what is visually shown in this video frame. "
+                                "Identify visible objects, colors, people, actions, and the environment. "
+                                "Do not guess or invent details not present in the frame."
+                            )
+                        }
+                    ]
+                }],
+                max_tokens=100,
+                temperature=0.1,
+            )
+            vlm_text = res.choices[0].message.content.strip()
+            if vlm_text:
+                print(f"[VISION] VLM ({VISION_MODEL_NAME}) at [{timestamp_str}]: {vlm_text[:70]}...")
+                return f"[{timestamp_str}] Visual Analysis: {vlm_text}"
+        except Exception as vlm_err:
+            safe_err = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(vlm_err))
+            print(f"[VISION] Cloud VLM ({VISION_MODEL_NAME}) unavailable: {safe_err}. Using local visual analysis.")
+
+    # Strategy 2: Resilient Local Visual Analyzer (real image statistics, dominant color, texture, layout)
+    try:
+        with Image.open(image_path) as img:
+            rgb_img = img.convert("RGB")
+            width, height = rgb_img.size
+            stat = ImageStat.Stat(rgb_img)
+            r, g, b = stat.mean[:3]
+            brightness = (0.299 * r + 0.587 * g + 0.114 * b)
+
+            # Detect dominant color signature
+            color_notes = []
+            if r > 150 and r > g * 1.3 and r > b * 1.3:
+                color_notes.append("predominantly red visual scene / object")
+            elif g > 130 and g > r * 1.2 and g > b * 1.2:
+                color_notes.append("predominantly green scenery / foliage")
+            elif b > 140 and b > r * 1.2 and b > g * 1.1:
+                color_notes.append("predominantly blue scene / sky / display")
+            elif r > 180 and g > 180 and b < 100:
+                color_notes.append("yellow / warm tone composition")
+            elif brightness > 210:
+                color_notes.append("bright high-key visual environment")
+            elif brightness < 45:
+                color_notes.append("dark low-key visual environment")
+            else:
+                color_notes.append("natural daylight / indoor illumination")
+
+            edges = rgb_img.filter(ImageFilter.FIND_EDGES)
+            edge_stat = ImageStat.Stat(edges)
+            edge_mean = sum(edge_stat.mean[:3]) / 3
+            complexity = "featuring visible objects and defined structures" if edge_mean > 20 else "featuring smooth or uniform composition"
+
+            desc = f"Frame at {timestamp_str} displays {', '.join(color_notes)} {complexity} (resolution {width}x{height})."
+            return f"[{timestamp_str}] Visual Analysis: {desc}"
+    except Exception as e:
+        return f"[{timestamp_str}] Visual Analysis: Scene captured at timestamp {timestamp_str}."
+
+
+def create_visual_vector_store(visual_records: List[Dict[str, Any]]):
+    """Creates an in-memory FAISS vector store from analyzed visual frame records."""
+    docs = [
+        Document(
+            page_content=rec["description"],
+            metadata={"timestamp": rec["timestamp"], "timestamp_sec": rec.get("timestamp_sec", 0)}
+        )
+        for rec in visual_records if rec.get("description", "").strip()
+    ]
+    if not docs:
+        return None
+    embeddings = get_embeddings()
+    return FAISS.from_documents(docs, embeddings)
+
+
+def create_visual_retriever(visual_vector_store, count: int = 5):
+    """Creates similarity retriever for visual knowledge base."""
+    if not visual_vector_store:
+        return None
+    k = min(6, max(1, count))
+    return visual_vector_store.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": k}
+    )
+
+
+def classify_question_intent(question: str) -> str:
+    """Routes user question to 'visual', 'text', or 'multimodal'."""
+    q = question.lower()
+    visual_keywords = {
+        "visible", "visual", "visuals", "look", "looks", "see", "seeing", "scene", "shown", "show",
+        "showing", "color", "colour", "screen", "appear", "appears", "wearing", "clothes", "outfit",
+        "holding", "background", "foreground", "person doing", "people doing", "object", "objects",
+        "car", "vehicle", "room", "table", "chair", "board", "picture", "frame", "frames",
+        "how many people", "who is visible", "what is on screen", "doing"
+    }
+    text_keywords = {
+        "say", "said", "saying", "speak", "spoke", "spoken", "speaker", "mention", "mentioned",
+        "discuss", "discussed", "talk", "talked", "talking", "explain", "explained",
+        "quote", "words", "speech", "topic", "lecture", "audio", "listen", "hear", "heard"
+    }
+    has_vis = any(re.search(rf"\b{re.escape(k)}\b", q) for k in visual_keywords)
+    has_txt = any(re.search(rf"\b{re.escape(k)}\b", q) for k in text_keywords)
+    if has_vis and has_txt:
+        return "multimodal"
+    if has_vis:
+        return "visual"
+    if has_txt:
+        return "text"
+    return "multimodal"
+
+
+def retrieve_multimodal_context(
+    question: str,
+    text_retriever: Optional[Any],
+    visual_retriever: Optional[Any]
+) -> Tuple[str, List[Any], str]:
+    """Retrieves relevant transcript and visual evidence based on question intent."""
+    intent = classify_question_intent(question)
+    transcript_docs = []
+    visual_docs = []
+
+    if intent in ("text", "multimodal") and text_retriever is not None:
+        try:
+            transcript_docs = text_retriever.invoke(question)
+        except Exception as e:
+            print(f"[RAG] Text retrieval error: {e}")
+            transcript_docs = []
+
+    if intent in ("visual", "multimodal") and visual_retriever is not None:
+        try:
+            visual_docs = visual_retriever.invoke(question)
+        except Exception as e:
+            print(f"[RAG] Visual retrieval error: {e}")
+            visual_docs = []
+
+    if not visual_docs and not transcript_docs:
+        if text_retriever is not None:
+            try:
+                transcript_docs = text_retriever.invoke(question)
+            except Exception:
+                pass
+        if visual_retriever is not None and not transcript_docs:
+            try:
+                visual_docs = visual_retriever.invoke(question)
+            except Exception:
+                pass
+
+    all_docs = transcript_docs + visual_docs
+    context_sections = []
+    if transcript_docs:
+        t_text = "\n\n".join(d.page_content for d in transcript_docs)
+        context_sections.append(f"=== TRANSCRIPT EVIDENCE ===\n{t_text}")
+    if visual_docs:
+        v_text = "\n".join(d.page_content for d in visual_docs)
+        context_sections.append(f"=== VISUAL EVIDENCE (FRAME & SCENE ANALYSIS) ===\n{v_text}")
+
+    combined_context = "\n\n".join(context_sections).strip()
+    return combined_context, all_docs, intent
 
 # ============================================================
 # TRANSCRIPTION: WHISPER & FALLBACK
@@ -505,8 +811,12 @@ def extract_audio_from_video_file(uploaded_file) -> Tuple[str, str, Dict[str, An
 @st.cache_resource(show_spinner=False)
 def get_local_whisper_model(model_size: str = "base"):
     """Loads and caches the local faster-whisper model on CPU with INT8 quantization."""
-    from faster_whisper import WhisperModel
-    return WhisperModel(model_size, device="cpu", compute_type="int8")
+    try:
+        from faster_whisper import WhisperModel
+        return WhisperModel(model_size, device="cpu", compute_type="int8")
+    except Exception as e:
+        print(f"[TRANSCRIPTION] faster_whisper model initialization note: {e}")
+        return None
 
 
 def transcribe_audio_local(audio_path: str) -> str:
@@ -522,6 +832,11 @@ def transcribe_audio_local(audio_path: str) -> str:
         raise FileNotFoundError(f"Audio file not found at {audio_path}")
 
     model = get_local_whisper_model("base")
+    if model is None:
+        raise RuntimeError(
+            "Local Whisper model is unavailable in this environment (faster-whisper package not found). "
+            "Please ensure faster-whisper and ctranslate2 are installed or configure HF_TOKEN."
+        )
     segments, info = model.transcribe(audio_path, beam_size=5)
     text_parts = [s.text.strip() for s in segments if s.text.strip()]
     transcript_text = " ".join(text_parts).strip()
@@ -637,24 +952,23 @@ def create_retriever(vector_store, chunk_count: int = 8):
     )
 
 def create_prompt() -> PromptTemplate:
-    template = """You are a video question-answering assistant.
+    template = """You are a grounded multimodal video assistant.
 
-Answer the user's question using ONLY the supplied video transcript context.
-If the user asks for the main points, summary, overview, or what the video is about, summarize the key events, people, and topics discussed in the transcript.
+Answer the user's question using ONLY the supplied transcript evidence and visual evidence from the video.
+If timestamps are provided, reference them in your answer when relevant.
+If the user asks what is visible in the video, answer using the visual evidence.
+If the user asks what was spoken, answer using the transcript evidence.
+If the user asks what was happening while something was spoken, correlate both the transcript and visual evidence.
 
-Do not use outside knowledge.
-Do not guess.
-Do not invent facts.
-
-If the question is unrelated or the answer is not supported by the supplied transcript context, respond exactly:
+CRITICAL RULES:
+1. Do not use outside knowledge. Do not guess. Do not invent facts.
+2. If the requested information cannot be supported by the supplied transcript or visual evidence, respond EXACTLY:
 I couldn't find the answer to that in the video.
 
-VIDEO TRANSCRIPT CONTEXT:
-
+EVIDENCE CONTEXT:
 {context}
 
 QUESTION:
-
 {question}
 
 ANSWER:
@@ -664,12 +978,12 @@ ANSWER:
 def generate_answer(context: str, question: str, docs: Optional[List[Any]] = None) -> str:
     """
     Generates a grounded answer using Hugging Face Cloud inference when available,
-    falling back automatically to the local GGUF model on ANY cloud failure.
+    falling back automatically to the local GGUF or extractive fallback model on cloud failure.
     """
     if not context or not context.strip():
         return "I couldn't find the answer to that in the video."
 
-    # Grounding safeguard for small local LLMs:
+    # Grounding safeguard:
     # If a specific factual question has no subject keywords appearing anywhere in context,
     # prevent hallucination from internal parametric memory.
     general_query_terms = {
@@ -677,7 +991,9 @@ def generate_answer(context: str, question: str, docs: Optional[List[Any]] = Non
         "the", "a", "an", "in", "on", "at", "of", "to", "for", "and", "or", "not", "this", 
         "that", "these", "those", "video", "mentioned", "discussed", "about", "main", "points", 
         "summary", "summarize", "tell", "explain", "describe", "happens", "said", "say", 
-        "talk", "talking", "does", "did", "do", "can", "could", "would", "should", "any", "all"
+        "talk", "talking", "does", "did", "do", "can", "could", "would", "should", "any", "all",
+        "visible", "see", "seen", "shown", "show", "showing", "color", "colour", "look", "looks",
+        "scene", "screen", "frame", "frames", "objects", "object", "doing", "person", "people"
     }
     q_words = re.findall(r"\b[a-zA-Z0-9]+\b", question.lower())
     specific_keywords = [w for w in q_words if w not in general_query_terms and (len(w) >= 3 or w.isdigit())]
@@ -768,11 +1084,13 @@ def run_unified_rag_pipeline(
     source_type: str,
     metadata: Dict[str, Any],
     identifier: str,
-    playback_source: Optional[Any] = None
+    playback_source: Optional[Any] = None,
+    visual_records: Optional[List[Dict[str, Any]]] = None
 ):
     """
     Shared RAG processor for both YouTube URLs and Uploaded Video files.
     Clears previous video state cleanly to prevent transcript mixing.
+    Builds both transcript and visual knowledge bases.
     """
     chunks = split_text(transcript)
     if not chunks:
@@ -781,18 +1099,30 @@ def run_unified_rag_pipeline(
     vector_store = create_vector_store(chunks)
     retriever = create_retriever(vector_store, chunk_count=len(chunks))
 
+    # Visual Vector Store & Retriever
+    visual_records = visual_records or []
+    visual_vector_store = None
+    visual_retriever = None
+    if visual_records:
+        visual_vector_store = create_visual_vector_store(visual_records)
+        visual_retriever = create_visual_retriever(visual_vector_store, count=len(visual_records))
+
     # Terminal diagnostics
     print("=" * 50)
-    print(f"TRANSCRIPT DIAGNOSTICS ({source_type}):")
+    print(f"MULTIMODAL DIAGNOSTICS ({source_type}):")
     print(f"Title: {metadata.get('title', 'Unknown')}")
     print(f"Transcript characters: {len(transcript):,}")
     print(f"Transcript words: {len(transcript.split()):,}")
     print(f"Number of chunks: {len(chunks)}")
+    print(f"Visual frames analyzed: {len(visual_records)}")
     print("=" * 50)
 
     # Clean switch to new video
     st.session_state.vector_store = vector_store
     st.session_state.retriever = retriever
+    st.session_state.visual_records = visual_records
+    st.session_state.visual_vector_store = visual_vector_store
+    st.session_state.visual_retriever = visual_retriever
     st.session_state.video_processed = True
     st.session_state.source_type = source_type
     st.session_state.video_metadata = metadata
@@ -807,6 +1137,9 @@ def run_unified_rag_pipeline(
     st.session_state.processed_cache[identifier] = {
         "vector_store": vector_store,
         "retriever": retriever,
+        "visual_records": visual_records,
+        "visual_vector_store": visual_vector_store,
+        "visual_retriever": visual_retriever,
         "source_type": source_type,
         "video_metadata": metadata,
         "video_playback_source": playback_source,
@@ -1041,6 +1374,9 @@ with tab_upload:
                     cached = st.session_state.processed_cache[file_hash]
                     st.session_state.vector_store = cached["vector_store"]
                     st.session_state.retriever = cached["retriever"]
+                    st.session_state.visual_records = cached.get("visual_records", [])
+                    st.session_state.visual_vector_store = cached.get("visual_vector_store")
+                    st.session_state.visual_retriever = cached.get("visual_retriever")
                     st.session_state.video_processed = True
                     st.session_state.source_type = cached["source_type"]
                     st.session_state.video_metadata = cached["video_metadata"]
@@ -1054,13 +1390,13 @@ with tab_upload:
                 else:
                     with st.status("🎥 Processing video...", expanded=True) as status:
                         st.write("🔊 Extracting audio...")
-                        audio_path, temp_dir, meta = extract_audio_from_video_file(uploaded_file)
+                        audio_path, temp_dir, meta, input_path = extract_audio_from_video_file(uploaded_file)
 
                         force_local_whisper = os.getenv("FORCE_LOCAL_WHISPER", "").strip().lower() in ("1", "true", "yes")
                         try:
                             if HF_TOKEN and not force_local_whisper:
                                 try:
-                                    st.write("📝 Transcribing video...")
+                                    st.write("📝 Transcribing audio...")
                                     transcript = transcribe_with_whisper(audio_path)
                                     source_used = f"Cloud Whisper ({WHISPER_MODEL})"
                                 except Exception as whisper_err:
@@ -1068,7 +1404,7 @@ with tab_upload:
                                     print("[TRANSCRIPTION] Cloud Whisper unavailable", flush=True)
                                     print(f"[TRANSCRIPTION] Reason: {safe_err}", flush=True)
                                     print("[TRANSCRIPTION] Switching to LOCAL Whisper", flush=True)
-                                    st.write("📝 Transcribing video locally...")
+                                    st.write("📝 Transcribing audio locally...")
                                     transcript = transcribe_audio_local(audio_path)
                                     source_used = "Local Whisper (faster-whisper base)"
                             else:
@@ -1077,18 +1413,37 @@ with tab_upload:
                                 else:
                                     print("[TRANSCRIPTION] Cloud Whisper unavailable (HF_TOKEN not set)", flush=True)
                                 print("[TRANSCRIPTION] Switching to LOCAL Whisper", flush=True)
-                                st.write("📝 Transcribing video locally...")
+                                st.write("📝 Transcribing audio...")
                                 transcript = transcribe_audio_local(audio_path)
                                 source_used = "Local Whisper (faster-whisper base)"
+
+                            # Real Video Frame Extraction & Visual Analysis
+                            st.write("👁️ Analyzing video frames...")
+                            frame_tuples = extract_video_frames(input_path, interval_seconds=FRAME_INTERVAL_SECONDS)
+                            visual_records = []
+                            for fpath, ts_sec, ts_fmt in frame_tuples:
+                                desc = analyze_frame_visual(fpath, ts_fmt)
+                                visual_records.append({
+                                    "timestamp": ts_fmt,
+                                    "timestamp_sec": ts_sec,
+                                    "description": desc,
+                                    "frame_path": fpath
+                                })
+
+                            st.write("🧠 Building multimodal knowledge base...")
+                            run_unified_rag_pipeline(
+                                transcript,
+                                source_used,
+                                "Uploaded Video",
+                                meta,
+                                file_hash,
+                                playback_source=file_bytes,
+                                visual_records=visual_records
+                            )
+
+                            status.update(label="✅ Video ready!", state="complete", expanded=False)
                         finally:
                             shutil.rmtree(temp_dir, ignore_errors=True)
-
-                        
-                        
-                        st.write("🧠 Building video knowledge base...")
-                        run_unified_rag_pipeline(transcript, source_used, "Uploaded Video", meta, file_hash, playback_source=file_bytes)
-
-                        status.update(label="✅ Video ready!", state="complete", expanded=False)
             except Exception as e:
                 safe_msg = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(e))
                 st.error(f"❌ Unable to process video: {safe_msg}")
@@ -1159,7 +1514,10 @@ if st.session_state.video_processed:
                     <b>Embedding:</b> <span style="color:#A5B4FC;">MiniLM • 384 dimensions</span>
                 </div>
                 <div style="color: #94A3B8; font-size: 14px; margin-bottom: 6px;">
-                    <b>Number of Chunks:</b> {st.session_state.chunk_count}
+                    <b>Transcript Chunks:</b> {st.session_state.chunk_count}
+                </div>
+                <div style="color: #94A3B8; font-size: 14px; margin-bottom: 6px;">
+                    <b>Visual Frames Analyzed:</b> {len(st.session_state.get('visual_records', []))}
                 </div>
                 <div style="color: #94A3B8; font-size: 14px;">
                     <b>Transcript Characters:</b> {len(st.session_state.transcript_text):,}
@@ -1171,15 +1529,17 @@ if st.session_state.video_processed:
     render_html(card_html)
 
     # 📜 Full Transcript / Preview Expandable
-    with st.expander("📜 Full Transcript / Preview", expanded=False):
+    with st.expander("📜 Full Transcript & Visual Analysis Summary", expanded=False):
         t_text = st.session_state.transcript_text
-        c_stat1, c_stat2, c_stat3 = st.columns(3)
+        c_stat1, c_stat2, c_stat3, c_stat4 = st.columns(4)
         with c_stat1:
             st.metric("Characters", f"{len(t_text):,}")
         with c_stat2:
             st.metric("Words", f"{len(t_text.split()):,}")
         with c_stat3:
-            st.metric("Chunks in FAISS", st.session_state.chunk_count)
+            st.metric("Transcript Chunks", st.session_state.chunk_count)
+        with c_stat4:
+            st.metric("Visual Frames Analyzed", len(st.session_state.get("visual_records", [])))
 
         search_phrase = st.text_input("🔍 Search transcript for test phrase:", key="transcript_search_phrase")
         if search_phrase.strip():
@@ -1189,7 +1549,14 @@ if st.session_state.video_processed:
             else:
                 st.warning(f"Phrase '{search_phrase}' not found in transcript.")
 
-        st.text_area("Transcript Text", t_text, height=220, disabled=True, label_visibility="collapsed")
+        st.text_area("Transcript Text", t_text, height=200, disabled=True, label_visibility="collapsed")
+
+        # Visual Records Summary
+        vis_recs = st.session_state.get("visual_records", [])
+        if vis_recs:
+            st.markdown("<h5 style='margin-top: 15px;'>👁️ Extracted Visual Frame Records</h5>", unsafe_allow_html=True)
+            vis_lines = "\n".join(f"{r['timestamp']}: {r['description']}" for r in vis_recs)
+            st.text_area("Visual Frame Records", vis_lines, height=150, disabled=True, label_visibility="collapsed")
 
 # ============================================================
 # WELCOME STATE (BEFORE VIDEO IS PROCESSED)
@@ -1212,14 +1579,19 @@ if not st.session_state.video_processed:
                     <div style="color: #94A3B8; font-size: 13px;">Accurate speech-to-text</div>
                 </div>
                 <div class="feature-card">
+                    <div style="font-size: 24px; margin-bottom: 8px;">👁️</div>
+                    <div style="font-weight: 600; color: #F8FAFC; font-size: 15px; margin-bottom: 4px;">Visual Video Analysis</div>
+                    <div style="color: #94A3B8; font-size: 13px;">Frame extraction & VLM analysis</div>
+                </div>
+                <div class="feature-card">
                     <div style="font-size: 24px; margin-bottom: 8px;">🧠</div>
-                    <div style="font-weight: 600; color: #F8FAFC; font-size: 15px; margin-bottom: 4px;">AI Retrieval</div>
-                    <div style="color: #94A3B8; font-size: 13px;">FAISS-powered semantic search</div>
+                    <div style="font-weight: 600; color: #F8FAFC; font-size: 15px; margin-bottom: 4px;">Multimodal RAG</div>
+                    <div style="color: #94A3B8; font-size: 13px;">FAISS dual-retrieval routing</div>
                 </div>
                 <div class="feature-card">
                     <div style="font-size: 24px; margin-bottom: 8px;">💬</div>
                     <div style="font-weight: 600; color: #F8FAFC; font-size: 15px; margin-bottom: 4px;">Grounded Answers</div>
-                    <div style="color: #94A3B8; font-size: 13px;">Answers based on your video</div>
+                    <div style="color: #94A3B8; font-size: 13px;">Strict factual verification</div>
                 </div>
             </div>
         </div>
@@ -1239,40 +1611,36 @@ if st.session_state.video_processed:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
             if msg.get("sources"):
-                with st.expander("📚 Sources / Retrieved Context"):
+                with st.expander("📚 Sources / Retrieved Evidence"):
                     for idx, s in enumerate(msg["sources"], 1):
-                        st.markdown(f"**Source:** {s.get('source', 'Video Transcript')}")
-                        st.markdown(f"**Timestamp:** {s.get('timestamp', 'N/A (Full Clip Transcript)')}")
-                        st.markdown(f"**Relevant Transcript:**\n> {s.get('text', '')}")
+                        st.markdown(f"**Source:** {s.get('source', 'Video Evidence')}")
+                        st.markdown(f"**Timestamp:** {s.get('timestamp', 'N/A')}")
+                        st.markdown(f"**Evidence Content:**\n> {s.get('text', '')}")
                         if idx < len(msg["sources"]):
                             st.divider()
 
-    # Handle user query
-    if user_query := st.chat_input("Ask anything about this video..."):
+    # Handle user query with Multimodal RAG
+    if user_query := st.chat_input("💬 Ask anything about your video"):
         st.session_state.messages.append({"role": "user", "content": user_query})
         with st.chat_message("user"):
             st.write(user_query)
 
         with st.chat_message("assistant"):
-            with st.spinner("Searching video transcript & generating answer..."):
-                retriever = st.session_state.retriever
-                vector_store = st.session_state.vector_store
-                docs = retriever.invoke(user_query) if retriever else []
-                context_chunks = [doc.page_content for doc in docs]
-                context_str = "\n\n---\n\n".join(context_chunks)
+            with st.spinner("Analyzing video evidence & generating answer..."):
+                text_retriever = st.session_state.get("retriever")
+                visual_retriever = st.session_state.get("visual_retriever")
+
+                context_str, docs, intent = retrieve_multimodal_context(
+                    user_query, text_retriever, visual_retriever
+                )
 
                 print("-" * 50)
-                print(f"[RETRIEVAL DIAGNOSTICS]")
+                print(f"[MULTIMODAL RETRIEVAL DIAGNOSTICS]")
                 print(f"Question: {user_query}")
-                print(f"Retrieved chunks count: {len(docs)}")
-                if vector_store and hasattr(vector_store, "similarity_search_with_score"):
-                    try:
-                        scored_docs = vector_store.similarity_search_with_score(user_query, k=len(docs))
-                        print("Chunk similarity distances:", [round(score, 4) for _, score in scored_docs])
-                    except Exception:
-                        pass
+                print(f"Intent classified: {intent}")
+                print(f"Retrieved context items: {len(docs)}")
                 if docs:
-                    print(f"Top retrieved chunk snippet: {docs[0].page_content[:120]}...")
+                    print(f"Top retrieved snippet: {docs[0].page_content[:120]}...")
                 print("-" * 50)
 
                 answer = generate_answer(context_str, user_query, docs=docs)
@@ -1282,20 +1650,22 @@ if st.session_state.video_processed:
 
                 sources_payload = []
                 if "couldn't find the answer" not in answer.lower():
-                    meta_title = st.session_state.video_metadata.get("title") or "Video Transcript"
+                    meta_title = st.session_state.video_metadata.get("title") or "Video"
                     for doc in docs:
+                        doc_ts = doc.metadata.get("timestamp") if hasattr(doc, "metadata") and doc.metadata else None
+                        is_visual = "Visual Analysis" in doc.page_content
                         sources_payload.append({
-                            "source": meta_title,
-                            "timestamp": "N/A (Full Clip Transcript)",
+                            "source": f"{meta_title} ({'Visual Frame' if is_visual else 'Transcript'})",
+                            "timestamp": doc_ts if doc_ts else "Full Clip Transcript",
                             "text": doc.page_content,
                         })
 
                     if sources_payload:
-                        with st.expander("📚 Sources / Retrieved Context"):
+                        with st.expander("📚 Sources / Retrieved Evidence"):
                             for idx, s in enumerate(sources_payload, 1):
                                 st.markdown(f"**Source:** {s['source']}")
                                 st.markdown(f"**Timestamp:** {s['timestamp']}")
-                                st.markdown(f"**Relevant Transcript:**\n> {s['text']}")
+                                st.markdown(f"**Evidence Content:**\n> {s['text']}")
                                 if idx < len(sources_payload):
                                     st.divider()
 

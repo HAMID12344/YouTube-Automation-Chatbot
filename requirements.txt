@@ -16,3 +16,4 @@ faiss-cpu
 sentence-transformers
 huggingface-hub
 requests
+Pillow
