@@ -1,487 +1,114 @@
-# 🎥🤖 RAG YouTube Chatbot
+# LocalMind AI — Video & YouTube Automation Chatbot (RAG)
 
-> **Chat with YouTube videos using Retrieval-Augmented Generation (RAG)!**
+> **Chat with YouTube videos and local video files using Retrieval-Augmented Generation (RAG)!**
 
-An intelligent **YouTube Video Question-Answering chatbot** that allows users to provide a YouTube video and ask questions about its content.
+An intelligent **Video Question-Answering Chatbot** built with Streamlit, FAISS, Whisper, and Dual LLM (Cloud + Local GGUF).
 
-Instead of sending the entire transcript to an LLM, the application retrieves only the **most relevant pieces of information** and uses them to generate accurate, context-aware answers.
-
----
-
-## 🌟 Demo
-
-🚀 **Live Application:** https://rag-youtube-chatbot.streamlit.app/
-
-📂 **GitHub Repository:**  
-https://github.com/yashrajan-ai/rag-youtube-chatbot
+The application supports both YouTube links and uploaded video files (MP4, MKV, MOV, WebM, AVI), extracting audio, generating transcripts via Whisper, chunking text, indexing vectors in FAISS, and answering questions strictly grounded in the video's content—even without cloud credits or an internet connection.
 
 ---
 
-## ✨ Features
+## 🚀 Key Features
 
 | Feature | Description |
 |---|---|
-| 🎥 YouTube Integration | Extract content from YouTube videos |
-| 📝 Transcript Processing | Retrieves and processes video transcripts |
-| ✂️ Smart Chunking | Splits transcripts into meaningful chunks |
-| 🔎 Semantic Retrieval | Finds the most relevant information |
-| 🧠 RAG Pipeline | Combines retrieval with LLM generation |
-| 💬 Interactive Chat | Ask questions about the video |
-| ⚡ Context-Aware Answers | Answers using retrieved video context |
-| 🌐 Streamlit UI | Simple and interactive web interface |
+| 📺 **YouTube Integration** | Extract transcripts from YouTube URLs with yt-dlp and fallback caption extraction |
+| 📁 **Local Video Upload** | Upload MP4, MKV, MOV, WEBM, AVI files (up to 200MB) with in-memory audio extraction |
+| 🎙️ **Dual Whisper Transcription** | Hugging Face Cloud Whisper with automatic fallback to local `faster-whisper` (CPU INT8) |
+| 🧠 **Semantic Chunking** | Splits transcripts using `RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)` |
+| ⚡ **Local Embeddings** | Fast, offline 384-dimensional embeddings via `paraphrase-multilingual-MiniLM-L12-v2` |
+| 🔍 **In-Memory FAISS Vector Store** | Real-time similarity retrieval of the most relevant transcript passages |
+| 🤖 **Dual LLM Architecture** | Cloud LLM (Qwen2.5-72B via Hugging Face) + In-Process Local GGUF (`qwen2.5-0.5b-instruct` via `llama-cpp-python`) |
+| 🛡️ **Grounding Protection** | Returns *"I couldn't find the answer to that in the video."* for out-of-scope trivia; protects valid qualifying phrases |
+| 🔄 **Video Isolation** | Clear session state and vector store resets when switching between videos |
 
 ---
 
-# 🧠 What is RAG?
+## 🛠️ Architecture & Pipeline
 
-**Retrieval-Augmented Generation (RAG)** combines information retrieval with Large Language Models.
-
-Instead of asking an LLM to answer a question only from its general knowledge, RAG first retrieves relevant information from a knowledge source and provides it to the LLM as context.
-
-### Traditional LLM
-
-```text
-User Question
-      ↓
-     LLM
-      ↓
-   Answer
 ```
-
-### RAG
-
-```text
-                    ┌───────────────┐
-                    │ User Question │
-                    └───────┬───────┘
-                            ↓
-                    ┌───────────────┐
-                    │    Retriever  │
-                    └───────┬───────┘
-                            ↓
-                    ┌───────────────┐
-                    │ Relevant Docs │
-                    └───────┬───────┘
-                            ↓
-                 ┌────────────────────┐
-                 │       LLM          │
-                 │ + Retrieved Context│
-                 └──────────┬─────────┘
-                            ↓
-                    ┌───────────────┐
-                    │     Answer    │
-                    └───────────────┘
+USER UPLOADS VIDEO / YOUTUBE URL
+               ↓
+     AUDIO EXTRACTION (ffmpeg)
+               ↓
+   WHISPER TRANSCRIPTION (Local faster-whisper / Cloud)
+               ↓
+     NORMALIZED TRANSCRIPT
+               ↓
+  TEXT CHUNKING (1000 / 200 overlap)
+               ↓
+ LOCAL EMBEDDINGS (SentenceTransformer)
+               ↓
+       FAISS VECTOR STORE
+               ↓
+       USER ASKS QUESTION
+               ↓
+     SIMILARITY RETRIEVAL (Top-k chunks)
+               ↓
+ DUAL LLM (Cloud Qwen / Local GGUF fallback)
+               ↓
+        GROUNDED ANSWER
 ```
 
 ---
 
-# 🔄 How This Project Works
+## 📦 Installation & Setup
 
-```text
-          🎥 YouTube Video
-                 │
-                 ▼
-        📝 Get Transcript
-                 │
-                 ▼
-          ✂️ Text Chunking
-                 │
-                 ▼
-        🔢 Generate Embeddings
-                 │
-                 ▼
-          🗄️ Vector Store
-                 │
-                 ▼
-          🔎 Similarity Search
-                 │
-                 ▼
-          📚 Relevant Context
-                 │
-                 ▼
-             🧠 LLM
-                 │
-                 ▼
-          💬 Final Answer
-```
-
----
-
-# 🏗️ Project Architecture
-
-```text
-┌───────────────────────────────┐
-│          Streamlit UI         │
-│                               │
-│  YouTube URL + User Question  │
-└───────────────┬───────────────┘
-                │
-                ▼
-┌───────────────────────────────┐
-│       YouTube Transcript      │
-│            Loader             │
-└───────────────┬───────────────┘
-                │
-                ▼
-┌───────────────────────────────┐
-│        Text Processing        │
-│       Chunking / Cleaning     │
-└───────────────┬───────────────┘
-                │
-                ▼
-┌───────────────────────────────┐
-│      Embedding Model          │
-│   Text → Vector Representation│
-└───────────────┬───────────────┘
-                │
-                ▼
-┌───────────────────────────────┐
-│         Vector Store          │
-│       Similarity Search       │
-└───────────────┬───────────────┘
-                │
-                ▼
-┌───────────────────────────────┐
-│           Retriever           │
-│      Top Relevant Chunks      │
-└───────────────┬───────────────┘
-                │
-                ▼
-┌───────────────────────────────┐
-│             LLM               │
-│   Context + Question → Answer │
-└───────────────┬───────────────┘
-                │
-                ▼
-          💬 Chat Response
-```
-
----
-
-# 🛠️ Tech Stack
-
-### 💻 Programming
-- 🐍 Python
-
-### 🤖 AI / LLM
-- Large Language Model
-- Retrieval-Augmented Generation (RAG)
-- Embeddings
-- Semantic Search
-
-### 🔗 Frameworks & Libraries
-- LangChain
-- Streamlit
-- YouTube Transcript API
-- Vector Database / Vector Store
-- Python dotenv
-
-### ☁️ Deployment
-- Streamlit
-
----
-
-# 📂 Project Structure
-
-```text
-rag-youtube-chatbot/
-│
-├── app.py
-├── requirements.txt
-├── README.md
-└── .gitignore
-```
-
----
-
-# ⚙️ Installation
-
-## 1️⃣ Clone the Repository
-
+### 1. Clone Repository
 ```bash
-git clone https://github.com/yashrajan-ai/rag-youtube-chatbot.git
-cd rag-youtube-chatbot
+git clone https://github.com/HAMID12344/YouTube-Automation-Chatbot.git
+cd YouTube-Automation-Chatbot
 ```
 
-## 2️⃣ Create a Virtual Environment
-
-### Windows
-
+### 2. Set Up Virtual Environment
 ```bash
 python -m venv venv
-venv\Scripts\activate
-```
-
-### macOS / Linux
-
-```bash
-python3 -m venv venv
+# Windows:
+.\venv\Scripts\activate
+# Linux/macOS:
 source venv/bin/activate
 ```
 
-## 3️⃣ Install Dependencies
-
+### 3. Install Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
----
-
-# 🔑 Environment Variables
-
-Create a `.env` file in the project root:
-
+### 4. Configure Environment Variables (Optional)
+Create a `.env` file:
 ```env
-GOOGLE_API_KEY=your_api_key_here
+# Optional: Hugging Face token for cloud inference
+HF_TOKEN=your_huggingface_token_here
+
+# Optional: Force purely local processing (zero cloud credits)
+FORCE_LOCAL_LLM=0
+FORCE_LOCAL_WHISPER=0
+
+# Path to local GGUF model (default: models/qwen2.5-0.5b-instruct-q4_k_m.gguf)
+LOCAL_GGUF_MODEL_PATH=models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ```
 
-Use the API key required by your selected LLM.
-
-⚠️ **Never upload your `.env` file or API keys to GitHub.**
-
-Use `.env.example` instead:
-
-```env
-GOOGLE_API_KEY=your_api_key_here
-```
-
----
-
-# ▶️ Run the Application
-
+### 5. Run Streamlit Application
 ```bash
 streamlit run app.py
 ```
 
-The application will open in your browser.
+---
+
+## 📋 Requirements
+- Python 3.10+
+- `streamlit`
+- `faster-whisper`
+- `ctranslate2`
+- `llama-cpp-python`
+- `faiss-cpu`
+- `sentence-transformers`
+- `langchain` & `langchain-community`
+- `imageio-ffmpeg`
+- `yt-dlp`
 
 ---
 
-# 💬 How to Use
-
-### Step 1️⃣
-Enter a **YouTube video URL**.
-
-### Step 2️⃣
-The application retrieves the video's transcript.
-
-### Step 3️⃣
-The transcript is divided into smaller chunks.
-
-### Step 4️⃣
-The chunks are converted into embeddings and stored in a vector store.
-
-### Step 5️⃣
-Ask a question about the video.
-
-### Step 6️⃣
-The retriever finds the most relevant chunks.
-
-### Step 7️⃣
-The LLM uses the retrieved context to generate the answer.
-
----
-
-# 🧪 Example
-
-### 🎥 Video
-
-```text
-https://www.youtube.com/watch?v=example
-```
-
-### ❓ Question
-
-```text
-What are the main points discussed in this video?
-```
-
-### 🤖 Chatbot
-
-```text
-The video primarily discusses...
-
-1. ...
-2. ...
-3. ...
-```
-
----
-
-# 🎯 Why RAG?
-
-A complete YouTube transcript can contain thousands of words.
-
-Sending the entire transcript to an LLM every time can:
-
-❌ Increase token usage  
-❌ Increase latency  
-❌ Increase cost  
-❌ Provide unnecessary context  
-
-RAG solves this by retrieving only the **most relevant information**.
-
-```text
-Large Transcript
-      │
-      ▼
-   Chunking
-      │
-      ▼
-  Embeddings
-      │
-      ▼
-Vector Database
-      │
-      ▼
-Relevant Chunks
-      │
-      ▼
-     LLM
-      │
-      ▼
-Better Answer
-```
-
----
-
-# 🚀 Future Improvements
-
-- [ ] 🌍 Support multiple transcript languages
-- [ ] 🎙️ Support videos without available transcripts
-- [ ] 📚 Chat with multiple YouTube videos
-- [ ] 💾 Conversation history
-- [ ] 🔎 Improved retrieval
-- [ ] 🧠 Hybrid search
-- [ ] 📌 Source citations in answers
-- [ ] 🎤 Voice-based questions
-- [ ] 📄 Export conversation
-- [ ] 🌐 Chrome Extension
-- [ ] ⚡ Streaming LLM responses
-
----
-
-# ⚠️ Limitations
-
-Currently, the chatbot may depend on:
-
-- Availability of a YouTube transcript
-- Supported transcript languages
-- API availability
-- LLM/API rate limits
-- Quality of the generated transcript
-
-The quality of the final answer also depends on the quality of the retrieved context.
-
----
-```
-
-Recommended `.gitignore`:
-
-```gitignore
-.env
-venv/
-.venv/
-__pycache__/
-*.pyc
-.idea/
-.vscode/
-```
-
----
-
-# 📊 RAG Pipeline Summary
-
-| Stage | Purpose |
-|---|---|
-| 🎥 YouTube | Source of knowledge |
-| 📝 Transcript | Extract textual information |
-| ✂️ Chunking | Divide text into manageable pieces |
-| 🔢 Embeddings | Convert text into vectors |
-| 🗄️ Vector Store | Store searchable representations |
-| 🔎 Retriever | Find relevant chunks |
-| 🧠 LLM | Generate final response |
-| 💬 Streamlit | Provide interactive interface |
-
----
-
-# 🌟 Key Learning Outcomes
-
-This project demonstrates practical knowledge of:
-
-- Retrieval-Augmented Generation
-- Large Language Models
-- LangChain
-- Embeddings
-- Vector databases
-- Semantic similarity search
-- Prompt engineering
-- Document processing
-- Streamlit application development
-- API integration
-- AI application deployment
-
----
-
-# 🤝 Contributing
-
-Contributions are welcome!
-
-1. Fork the repository
-2. Create a new branch:
-
-```bash
-git checkout -b feature/new-feature
-```
-
-3. Make your changes
-4. Commit:
-
-```bash
-git commit -m "Add new feature"
-```
-
-5. Push:
-
-```bash
-git push origin feature/new-feature
-```
-
-6. Open a Pull Request
-
----
-
-# 👨‍💻 Author
-
-## Yash Rajan
-
-🎓 Computer Science & Engineering — AI/ML
-
-💡 Interested in:
-
-- Artificial Intelligence
-- Machine Learning
-- Generative AI
-- Data Science
-- Software Development
-
-### 🔗 Connect With Me
-
-- 💻 GitHub: https://github.com/yashrajan-ai
-- 🔗 LinkedIn: www.linkedin.com/in/yash-rajan1
-
----
-
-# ⭐ Support
-
-If you found this project useful, consider giving it a ⭐ on GitHub!
-
-<div align="center">
-
-### 🎥 Turn YouTube Videos into an Interactive Knowledge Base with RAG 🤖
-
-**Built with Python • LangChain • RAG • LLMs • Streamlit**
-
-⭐ **Star this repository if you like it!** ⭐
-
-</div>
+## 👤 Author
+**HAMID12344**
+- GitHub: [HAMID12344](https://github.com/HAMID12344)

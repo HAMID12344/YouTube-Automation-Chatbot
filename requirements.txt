@@ -3,6 +3,10 @@ python-dotenv
 youtube-transcript-api
 yt-dlp
 imageio-ffmpeg
+faster-whisper
+ctranslate2
+av
+llama-cpp-python
 langchain
 langchain-community
 langchain-core

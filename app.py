@@ -254,10 +254,10 @@ def compute_file_sha256(file_bytes: bytes) -> str:
 
 @st.cache_resource(show_spinner=False)
 def get_embeddings():
-    require_hf_token()
+    kwargs = {"token": HF_TOKEN} if HF_TOKEN else {}
     return HuggingFaceEmbeddings(
         model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-        model_kwargs={"token": HF_TOKEN},
+        model_kwargs=kwargs,
         encode_kwargs={"normalize_embeddings": True},
     )
 
@@ -437,6 +437,44 @@ def extract_audio_from_video_file(uploaded_file) -> Tuple[str, str, Dict[str, An
 # TRANSCRIPTION: WHISPER & FALLBACK
 # ============================================================
 
+# ============================================================
+# LOCAL WHISPER TRANSCRIPTION (OFFLINE / ZERO CREDITS)
+# ============================================================
+
+@st.cache_resource(show_spinner=False)
+def get_local_whisper_model(model_size: str = "base"):
+    """Loads and caches the local faster-whisper model on CPU with INT8 quantization."""
+    from faster_whisper import WhisperModel
+    return WhisperModel(model_size, device="cpu", compute_type="int8")
+
+
+def transcribe_audio_local(audio_path: str) -> str:
+    """
+    Transcribes audio using a local faster-whisper model without requiring any Hugging Face credits.
+    1. Loads local Whisper model from cache.
+    2. Transcribes extracted audio.
+    3. Combines segments into one transcript.
+    4. Validates transcript is not empty.
+    """
+    print("[TRANSCRIPTION] Local Whisper started", flush=True)
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"Audio file not found at {audio_path}")
+
+    model = get_local_whisper_model("base")
+    segments, info = model.transcribe(audio_path, beam_size=5)
+    text_parts = [s.text.strip() for s in segments if s.text.strip()]
+    transcript_text = " ".join(text_parts).strip()
+
+    # Normalize whitespace
+    transcript_text = re.sub(r"\s+", " ", transcript_text).strip()
+    if not transcript_text:
+        raise ValueError("Local Whisper returned an empty transcript.")
+
+    print("[TRANSCRIPTION] Local transcription completed", flush=True)
+    return transcript_text
+
+
+transcribe_audio_with_whisper = None # alias defined below
 def transcribe_with_whisper(audio_path: str, max_retries: int = 3) -> str:
     """
     Performs speech-to-text using Hugging Face InferenceClient with openai/whisper-large-v3.
@@ -568,6 +606,24 @@ def generate_answer(context: str, question: str, docs: Optional[List[Any]] = Non
     """
     if not context or not context.strip():
         return "I couldn't find the answer to that in the video."
+
+    # Grounding safeguard for small local LLMs:
+    # If a specific factual question has no subject keywords appearing anywhere in context,
+    # prevent hallucination from internal parametric memory.
+    general_query_terms = {
+        "what", "who", "where", "when", "why", "how", "which", "is", "are", "was", "were", 
+        "the", "a", "an", "in", "on", "at", "of", "to", "for", "and", "or", "not", "this", 
+        "that", "these", "those", "video", "mentioned", "discussed", "about", "main", "points", 
+        "summary", "summarize", "tell", "explain", "describe", "happens", "said", "say", 
+        "talk", "talking", "does", "did", "do", "can", "could", "would", "should", "any", "all"
+    }
+    q_words = re.findall(r"\b[a-zA-Z0-9]+\b", question.lower())
+    specific_keywords = [w for w in q_words if w not in general_query_terms and (len(w) >= 3 or w.isdigit())]
+    if specific_keywords:
+        lower_context = context.lower()
+        if not any(kw in lower_context for kw in specific_keywords):
+            print(f"[GROUNDING] Specific keywords {specific_keywords} not found in context. Returning refusal.")
+            return "I couldn't find the answer to that in the video."
 
     prompt = create_prompt()
     formatted_prompt = prompt.format(context=context, question=question)
@@ -833,33 +889,57 @@ with tab_yt:
                     st.session_state.messages = []
                     st.success("✓ Video successfully processed (from session cache).")
                 else:
-                    with st.status("Processing Video...", expanded=True) as status:
-                        st.write("01 Audio Extraction")
+                    with st.status("🎥 Processing video...", expanded=True) as status:
+                        st.write("🔊 Extracting audio...")
                         audio_path, temp_dir, meta = extract_audio_from_youtube(yt_url)
 
                         transcript = None
                         source_used = None
 
-                        try:
-                            st.write("02 Whisper Transcription")
-                            transcript = transcribe_with_whisper(audio_path)
-                            source_used = f"Whisper ({WHISPER_MODEL})"
-                        except Exception as whisper_err:
-                            st.warning("Whisper API note: using secondary transcript fallback...")
-                            try:
-                                transcript = fetch_fallback_youtube_transcript(vid_id)
-                                source_used = "youtube_transcript_api (fallback)"
-                            except Exception as fb_err:
-                                raise RuntimeError(f"Both Whisper and YouTube transcript fallback failed.\nWhisper: {whisper_err}\nFallback: {fb_err}")
-                        finally:
-                            shutil.rmtree(temp_dir, ignore_errors=True)
+                        force_local_whisper = os.getenv("FORCE_LOCAL_WHISPER", "").strip().lower() in ("1", "true", "yes")
 
-                        st.write("03 Text Chunking")
-                        st.write("04 Embedding Generation")
-                        st.write("05 FAISS Indexing")
+                        # Strategy 1: Check YouTube native transcript first
+                        try:
+                            transcript = fetch_fallback_youtube_transcript(vid_id)
+                            if transcript and len(transcript.strip()) > 30:
+                                source_used = "YouTube Captions"
+                                print(f"[TRANSCRIPTION] Using YouTube native captions for video {vid_id}", flush=True)
+                        except Exception:
+                            transcript = None
+
+                        # Strategy 2: If native transcript not available, try Cloud Whisper, fallback to Local Whisper
+                        if not transcript:
+                            if HF_TOKEN and not force_local_whisper:
+                                try:
+                                    st.write("📝 Transcribing video...")
+                                    transcript = transcribe_with_whisper(audio_path)
+                                    source_used = f"Cloud Whisper ({WHISPER_MODEL})"
+                                except Exception as whisper_err:
+                                    safe_err = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(whisper_err))
+                                    print("[TRANSCRIPTION] Cloud Whisper unavailable", flush=True)
+                                    print(f"[TRANSCRIPTION] Reason: {safe_err}", flush=True)
+                                    print("[TRANSCRIPTION] Switching to LOCAL Whisper", flush=True)
+                                    st.write("📝 Transcribing video locally...")
+                                    transcript = transcribe_audio_local(audio_path)
+                                    source_used = "Local Whisper (faster-whisper base)"
+                            else:
+                                if force_local_whisper:
+                                    print("[TRANSCRIPTION] Cloud Whisper bypassed (FORCE_LOCAL_WHISPER=1)", flush=True)
+                                else:
+                                    print("[TRANSCRIPTION] Cloud Whisper unavailable (HF_TOKEN not set)", flush=True)
+                                print("[TRANSCRIPTION] Switching to LOCAL Whisper", flush=True)
+                                st.write("📝 Transcribing video locally...")
+                                transcript = transcribe_audio_local(audio_path)
+                                source_used = "Local Whisper (faster-whisper base)"
+
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+
+                        
+                        
+                        st.write("🧠 Building video knowledge base...")
                         run_unified_rag_pipeline(transcript, source_used, "YouTube", meta, vid_id, playback_source=f"https://www.youtube.com/watch?v={vid_id}")
 
-                        status.update(label="✓ Video successfully processed", state="complete", expanded=False)
+                        status.update(label="✅ Video ready!", state="complete", expanded=False)
             except Exception as e:
                 safe_msg = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(e))
                 st.error(f"❌ Unable to process video: {safe_msg}")
@@ -905,23 +985,43 @@ with tab_upload:
                     st.session_state.messages = []
                     st.success("✓ Video successfully processed (from session cache).")
                 else:
-                    with st.status("Processing Video...", expanded=True) as status:
-                        st.write("01 Audio Extraction")
+                    with st.status("🎥 Processing video...", expanded=True) as status:
+                        st.write("🔊 Extracting audio...")
                         audio_path, temp_dir, meta = extract_audio_from_video_file(uploaded_file)
 
+                        force_local_whisper = os.getenv("FORCE_LOCAL_WHISPER", "").strip().lower() in ("1", "true", "yes")
                         try:
-                            st.write("02 Whisper Transcription")
-                            transcript = transcribe_with_whisper(audio_path)
-                            source_used = f"Whisper ({WHISPER_MODEL})"
+                            if HF_TOKEN and not force_local_whisper:
+                                try:
+                                    st.write("📝 Transcribing video...")
+                                    transcript = transcribe_with_whisper(audio_path)
+                                    source_used = f"Cloud Whisper ({WHISPER_MODEL})"
+                                except Exception as whisper_err:
+                                    safe_err = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(whisper_err))
+                                    print("[TRANSCRIPTION] Cloud Whisper unavailable", flush=True)
+                                    print(f"[TRANSCRIPTION] Reason: {safe_err}", flush=True)
+                                    print("[TRANSCRIPTION] Switching to LOCAL Whisper", flush=True)
+                                    st.write("📝 Transcribing video locally...")
+                                    transcript = transcribe_audio_local(audio_path)
+                                    source_used = "Local Whisper (faster-whisper base)"
+                            else:
+                                if force_local_whisper:
+                                    print("[TRANSCRIPTION] Cloud Whisper bypassed (FORCE_LOCAL_WHISPER=1)", flush=True)
+                                else:
+                                    print("[TRANSCRIPTION] Cloud Whisper unavailable (HF_TOKEN not set)", flush=True)
+                                print("[TRANSCRIPTION] Switching to LOCAL Whisper", flush=True)
+                                st.write("📝 Transcribing video locally...")
+                                transcript = transcribe_audio_local(audio_path)
+                                source_used = "Local Whisper (faster-whisper base)"
                         finally:
                             shutil.rmtree(temp_dir, ignore_errors=True)
 
-                        st.write("03 Text Chunking")
-                        st.write("04 Embedding Generation")
-                        st.write("05 FAISS Indexing")
+                        
+                        
+                        st.write("🧠 Building video knowledge base...")
                         run_unified_rag_pipeline(transcript, source_used, "Uploaded Video", meta, file_hash, playback_source=file_bytes)
 
-                        status.update(label="✓ Video successfully processed", state="complete", expanded=False)
+                        status.update(label="✅ Video ready!", state="complete", expanded=False)
             except Exception as e:
                 safe_msg = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(e))
                 st.error(f"❌ Unable to process video: {safe_msg}")
@@ -1137,3 +1237,7 @@ if st.session_state.video_processed:
             "content": answer,
             "sources": sources_payload,
         })
+
+
+# Compatibility Alias
+transcribe_audio_with_whisper = transcribe_with_whisper
