@@ -517,28 +517,39 @@ def create_vector_store(chunks: List[Any]):
     embeddings = get_embeddings()
     return FAISS.from_documents(chunks, embeddings)
 
-def create_retriever(vector_store):
+def create_retriever(vector_store, chunk_count: int = 8):
+    if chunk_count >= 5:
+        k = min(8, max(5, chunk_count))
+    else:
+        k = max(1, chunk_count)
     return vector_store.as_retriever(
-        search_type="mmr",
-        search_kwargs={"k": 4, "fetch_k": 12, "lambda_mult": 0.7},
+        search_type="similarity",
+        search_kwargs={"k": k},
     )
 
 def create_prompt() -> PromptTemplate:
-    template = """You are a helpful and strictly factual AI assistant answering questions about a video.
+    template = """You are a video question-answering assistant.
 
-IMPORTANT RULES:
-1. Answer ONLY from the supplied video context.
-2. Do not invent, extrapolate, or fill in facts that are not present in the context.
-3. If the answer is NOT present or supported by the context, you MUST respond exactly:
-   "I couldn't find the answer to that in the video."
-4. Keep the answer clear and concise.
+Answer the user's question using ONLY the supplied video transcript context.
 
-VIDEO CONTEXT:
--------------------------
+Do not use outside knowledge.
+
+Do not guess.
+
+Do not invent facts.
+
+Do not assume information that is not present in the transcript.
+
+If the answer is not supported by the supplied transcript context, respond exactly:
+
+I couldn't find the answer to that in the video.
+
+VIDEO TRANSCRIPT CONTEXT:
+
 {context}
--------------------------
 
 QUESTION:
+
 {question}
 
 ANSWER:
@@ -546,7 +557,7 @@ ANSWER:
     return PromptTemplate(template=template, input_variables=["context", "question"])
 
 def generate_answer(context: str, question: str) -> str:
-    if not context.strip():
+    if not context or not context.strip():
         return "I couldn't find the answer to that in the video."
 
     prompt = create_prompt()
@@ -568,28 +579,19 @@ def generate_answer(context: str, question: str) -> str:
 
     answer_clean = answer.strip()
 
-    # Grounded answer safety check: normalize negative signals
-    negative_indicators = [
-        "couldn't find",
-        "could not find",
-        "cannot find",
-        "not found",
-        "not mentioned",
-        "not provided",
-        "not present",
-        "not in the context",
-        "not in the video",
-        "no information",
-        "does not mention",
-        "doesn't mention",
-        "don't have any information",
-        "do not have any information",
-        "isn't mentioned",
-        "is not mentioned",
-        "isn't provided",
-        "is not provided",
+    # Targeted refusal detection: only return fallback when model explicitly gives a short refusal
+    lower_ans = answer_clean.lower()
+    explicit_refusals = [
+        "i couldn't find the answer to that in the video",
+        "i could not find the answer to that in the video",
+        "i cannot find the answer to that in the video",
+        "the provided video context does not mention",
+        "the provided transcript does not mention",
+        "there is no mention of",
+        "not supported by the supplied transcript",
+        "not supported by the video",
     ]
-    if any(ind in answer_clean.lower() for ind in negative_indicators):
+    if any(p in lower_ans for p in explicit_refusals) and len(answer_clean) < 180:
         return "I couldn't find the answer to that in the video."
 
     return answer_clean
@@ -611,7 +613,16 @@ def run_unified_rag_pipeline(
         raise RuntimeError("Transcript text was empty or could not be chunked.")
 
     vector_store = create_vector_store(chunks)
-    retriever = create_retriever(vector_store)
+    retriever = create_retriever(vector_store, chunk_count=len(chunks))
+
+    # Terminal diagnostics
+    print("=" * 50)
+    print(f"TRANSCRIPT DIAGNOSTICS ({source_type}):")
+    print(f"Title: {metadata.get('title', 'Unknown')}")
+    print(f"Transcript characters: {len(transcript):,}")
+    print(f"Transcript words: {len(transcript.split()):,}")
+    print(f"Number of chunks: {len(chunks)}")
+    print("=" * 50)
 
     # Clean switch to new video
     st.session_state.vector_store = vector_store
@@ -949,6 +960,27 @@ if st.session_state.video_processed:
     """
     render_html(card_html)
 
+    # 📜 Full Transcript / Preview Expandable
+    with st.expander("📜 Full Transcript / Preview", expanded=False):
+        t_text = st.session_state.transcript_text
+        c_stat1, c_stat2, c_stat3 = st.columns(3)
+        with c_stat1:
+            st.metric("Characters", f"{len(t_text):,}")
+        with c_stat2:
+            st.metric("Words", f"{len(t_text.split()):,}")
+        with c_stat3:
+            st.metric("Chunks in FAISS", st.session_state.chunk_count)
+
+        search_phrase = st.text_input("🔍 Search transcript for test phrase:", key="transcript_search_phrase")
+        if search_phrase.strip():
+            count = t_text.lower().count(search_phrase.lower())
+            if count > 0:
+                st.success(f"✓ Found {count} occurrence(s) of '{search_phrase}' in transcript.")
+            else:
+                st.warning(f"Phrase '{search_phrase}' not found in transcript.")
+
+        st.text_area("Transcript Text", t_text, height=220, disabled=True, label_visibility="collapsed")
+
 # ============================================================
 # WELCOME STATE (BEFORE VIDEO IS PROCESSED)
 # ============================================================
@@ -1014,9 +1046,24 @@ if st.session_state.video_processed:
         with st.chat_message("assistant"):
             with st.spinner("Searching video transcript & generating answer..."):
                 retriever = st.session_state.retriever
+                vector_store = st.session_state.vector_store
                 docs = retriever.invoke(user_query) if retriever else []
                 context_chunks = [doc.page_content for doc in docs]
                 context_str = "\n\n---\n\n".join(context_chunks)
+
+                print("-" * 50)
+                print(f"[RETRIEVAL DIAGNOSTICS]")
+                print(f"Question: {user_query}")
+                print(f"Retrieved chunks count: {len(docs)}")
+                if vector_store and hasattr(vector_store, "similarity_search_with_score"):
+                    try:
+                        scored_docs = vector_store.similarity_search_with_score(user_query, k=len(docs))
+                        print("Chunk similarity distances:", [round(score, 4) for _, score in scored_docs])
+                    except Exception:
+                        pass
+                if docs:
+                    print(f"Top retrieved chunk snippet: {docs[0].page_content[:120]}...")
+                print("-" * 50)
 
                 answer = generate_answer(context_str, user_query)
                 st.write(answer)
