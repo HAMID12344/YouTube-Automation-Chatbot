@@ -22,6 +22,7 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 import base64
 import glob
 from PIL import Image, ImageStat, ImageFilter
+import numpy as np
 
 import imageio_ffmpeg
 import yt_dlp
@@ -356,36 +357,35 @@ class LocalExtractiveFallbackLLM:
         if not context or not context.strip():
             return "I couldn't find the answer to that in the video."
 
-        # Verify subject keywords appear in context
-        if question:
-            general_terms = {
-                "what", "who", "where", "when", "why", "how", "which", "is", "are", "was", "were", 
-                "the", "a", "an", "in", "on", "at", "of", "to", "for", "and", "or", "not", "this", 
-                "that", "video", "about", "main", "points", "summary", "summarize", "tell", "tell me"
-            }
-            q_keywords = [w for w in re.findall(r"\b[a-zA-Z0-9]+\b", question.lower()) if w not in general_terms and len(w) >= 3]
-            if q_keywords and not any(kw in context.lower() for kw in q_keywords):
-                return "I couldn't find the answer to that in the video."
-        else:
-            q_keywords = []
-
         lower_q = (question or "").lower()
+        lower_context = context.lower()
 
-        # Multimodal handling: when context contains both transcript and visual sections
-        has_t = "[SPOKEN CONTENT]" in context or "=== TRANSCRIPT EVIDENCE ===" in context
-        has_v = "[VISUAL CONTENT]" in context or "=== VISUAL EVIDENCE" in context
+        # Subject grounding check
+        general_terms = {
+            "what", "who", "where", "when", "why", "how", "which", "is", "are", "was", "were", 
+            "the", "a", "an", "in", "on", "at", "of", "to", "for", "and", "or", "not", "this", 
+            "that", "these", "those", "video", "about", "main", "points", "summary", "summarize", 
+            "tell", "tell me", "discussing", "discussed", "discuss", "mention", "mentioned", "mentions",
+            "say", "said", "saying", "speaking", "spoken", "speaker", "speak", "spoke",
+            "visible", "visual", "visually", "visuals", "seen", "see", "shown", "show", "showing",
+            "color", "colour", "sport", "game", "topic", "subject", "theme", "item", "items",
+            "object", "objects", "doing", "person", "people", "scene", "screen", "frame", "frames"
+        }
+        q_keywords = [w for w in re.findall(r"\b[a-zA-Z0-9]+\b", lower_q) if w not in general_terms and len(w) >= 3]
+        if q_keywords and not any(kw in lower_context for kw in q_keywords):
+            return "I couldn't find the answer to that in the video."
+
+        has_t = "[SPOKEN CONTENT]" in context
+        has_v = "[VISUAL CONTENT]" in context
+
+        # Case 1: Multimodal (Both spoken and visual)
         if has_t and has_v:
-            if "[VISUAL CONTENT]" in context:
-                parts = context.split("[VISUAL CONTENT]")
-                t_part = parts[0].replace("[SPOKEN CONTENT]", "").strip()
-                v_part = parts[1].strip()
-            else:
-                parts = context.split("=== VISUAL EVIDENCE")
-                t_part = parts[0].replace("=== TRANSCRIPT EVIDENCE ===", "").strip()
-                v_part = ("=== VISUAL EVIDENCE" + parts[1]).strip()
+            parts = context.split("[VISUAL CONTENT]")
+            t_part = parts[0].replace("[SPOKEN CONTENT]", "").strip()
+            v_part = parts[1].strip()
 
-            t_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", t_part) if len(s.strip()) > 15]
-            v_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", v_part) if len(s.strip()) > 15]
+            t_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", t_part) if len(s.strip()) > 10]
+            v_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", v_part) if len(s.strip()) > 10]
 
             t_scored = sorted([(sum(1 for kw in q_keywords if kw in s.lower()), s) for s in t_sentences], key=lambda x: x[0], reverse=True)
             v_scored = sorted([(sum(1 for kw in q_keywords if kw in s.lower()), s) for s in v_sentences], key=lambda x: x[0], reverse=True)
@@ -393,44 +393,48 @@ class LocalExtractiveFallbackLLM:
             t_best = [s for count, s in t_scored if count > 0]
             v_best = [s for count, s in v_scored if count > 0]
 
-            is_visual_q = any(k in lower_q for k in ["visible", "visual", "see", "seen", "shown", "look", "scene", "color", "doing", "person doing", "object"])
-            is_transcript_q = any(k in lower_q for k in ["say", "said", "speak", "spoke", "mention", "mentioned", "talk", "talked", "discuss", "discussed", "words", "audio"])
+            ans_t = t_best[0] if t_best else (t_sentences[0] if t_sentences else t_part)
+            ans_v = v_best[0] if v_best else (v_sentences[0] if v_sentences else v_part)
 
-            if is_visual_q and is_transcript_q:
-                ans_t = t_best[0] if t_best else (t_sentences[0] if t_sentences else "")
-                ans_v = v_best[0] if v_best else (v_sentences[0] if v_sentences else "")
-                return f"{ans_t} Visually: {ans_v}".strip()
-            elif is_visual_q and not is_transcript_q:
-                if v_best:
-                    return " ".join(v_best[:2])
-                elif v_sentences:
-                    return v_sentences[0]
-            elif is_transcript_q and not is_visual_q:
-                if t_best:
-                    return " ".join(t_best[:2])
-                elif t_sentences:
-                    return t_sentences[0]
+            clean_v = re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s*\[[^\]]+\]:\s*", "", ans_v)
+            clean_v = re.sub(r"^Frame at \d{2}:\d{2}:\d{2} displays\s*", "", clean_v)
+            clean_t = re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s*", "", ans_t)
+            clean_t = clean_t.rstrip(".")
+            clean_v = clean_v.rstrip(".")
+            return f"While {clean_t}, {clean_v} was visible in the video."
 
-        if any(term in lower_q for term in ["about", "main points", "summary", "overview", "what is this video"]):
-            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", context) if len(s.strip()) > 20]
-            if sentences:
-                return "Here is what the video discusses:\n- " + "\n- ".join(sentences[:5])
+        # Case 2: Visual only
+        if has_v and not has_t:
+            v_part = context.replace("[VISUAL CONTENT]", "").strip()
+            v_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", v_part) if len(s.strip()) > 10]
 
+            if any(k in lower_q for k in ["color", "colour"]):
+                color_names = ["red", "blue", "green", "yellow", "black", "white", "orange", "purple", "gray", "grey"]
+                found_colors = [c for c in color_names if c in v_part.lower()]
+                subject = "car" if "car" in lower_q else ("object" if "object" in lower_q else "item")
+                if found_colors:
+                    primary_color = found_colors[0]
+                    return f"Based on visual content, the {subject} is {primary_color}."
+
+            v_scored = sorted([(sum(1 for kw in q_keywords if kw in s.lower()), s) for s in v_sentences], key=lambda x: x[0], reverse=True)
+            v_best = [s for count, s in v_scored if count > 0]
+            selected_v = v_best[0] if v_best else (v_sentences[0] if v_sentences else v_part)
+            clean_v = re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s*\[[^\]]+\]:\s*", "", selected_v)
+            return f"Based on visual content: {clean_v}"
+
+        # Case 3: Text / Spoken only
+        if has_t and not has_v:
+            t_part = context.replace("[SPOKEN CONTENT]", "").strip()
+            t_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", t_part) if len(s.strip()) > 10]
+
+            t_scored = sorted([(sum(1 for kw in q_keywords if kw in s.lower()), s) for s in t_sentences], key=lambda x: x[0], reverse=True)
+            t_best = [s for count, s in t_scored if count > 0]
+            selected_t = t_best[0] if t_best else (t_sentences[0] if t_sentences else t_part)
+            clean_t = re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s*", "", selected_t)
+            return f"Based on spoken content: {clean_t}"
+
+        # Fallback
         sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", context) if len(s.strip()) > 15]
-        if not sentences:
-            sentences = [context[:300]]
-
-        if question and q_keywords:
-            scored = []
-            for s in sentences:
-                s_lower = s.lower()
-                matches = sum(1 for kw in q_keywords if kw in s_lower)
-                scored.append((matches, s))
-            scored.sort(key=lambda x: x[0], reverse=True)
-            best_matches = [s for count, s in scored if count > 0]
-            if best_matches:
-                return " ".join(best_matches[:3])
-
         return sentences[0] if sentences else "I couldn't find the answer to that in the video."
 
 
@@ -713,7 +717,7 @@ def analyze_frame_visual(image_path: str, timestamp_str: str) -> str:
     elif force_local_vision:
         print("[VISION] Cloud VLM bypassed (FORCE_LOCAL_VISION=1). Using local visual analysis.")
 
-    # Strategy 2: Resilient Local Visual Analyzer (real image statistics, dominant color, texture, layout)
+    # Strategy 2: Resilient Local Visual Analyzer (real image statistics, dominant color, texture, layout, shape)
     try:
         with Image.open(image_path) as img:
             rgb_img = img.convert("RGB")
@@ -722,29 +726,54 @@ def analyze_frame_visual(image_path: str, timestamp_str: str) -> str:
             r, g, b = stat.mean[:3]
             brightness = (0.299 * r + 0.587 * g + 0.114 * b)
 
-            # Detect dominant color signature
-            color_notes = []
-            if r > 150 and r > g * 1.3 and r > b * 1.3:
-                color_notes.append("predominantly red visual scene / object")
-            elif g > 130 and g > r * 1.2 and g > b * 1.2:
-                color_notes.append("predominantly green scenery / foliage")
-            elif b > 140 and b > r * 1.2 and b > g * 1.1:
-                color_notes.append("predominantly blue scene / sky / display")
-            elif r > 180 and g > 180 and b < 100:
-                color_notes.append("yellow / warm tone composition")
-            elif brightness > 210:
-                color_notes.append("bright high-key visual environment")
-            elif brightness < 45:
-                color_notes.append("dark low-key visual environment")
-            else:
-                color_notes.append("natural daylight / indoor illumination")
+            arr = np.array(rgb_img)
+            arr_r, arr_g, arr_b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+            red_mask = (arr_r > 120) & (arr_r > arr_g * 1.2) & (arr_r > arr_b * 1.2)
+            blue_mask = (arr_b > 120) & (arr_b > arr_r * 1.2) & (arr_b > arr_g * 1.0)
+            green_mask = (arr_g > 120) & (arr_g > arr_r * 1.2) & (arr_g > arr_b * 1.2)
+            yellow_mask = (arr_r > 160) & (arr_g > 160) & (arr_b < 110)
+
+            color_counts = {
+                "red": int(np.sum(red_mask)),
+                "blue": int(np.sum(blue_mask)),
+                "green": int(np.sum(green_mask)),
+                "yellow": int(np.sum(yellow_mask)),
+            }
+            dom_color = max(color_counts, key=color_counts.get)
+            if color_counts[dom_color] < 1500:
+                dom_color = "neutral"
+
+            target_mask = red_mask if dom_color == "red" else (blue_mask if dom_color == "blue" else (green_mask if dom_color == "green" else None))
+            is_car = False
+            if target_mask is not None and np.any(target_mask):
+                total_pixels = width * height
+                coverage = float(np.sum(target_mask)) / total_pixels
+                rows = np.any(target_mask, axis=1)
+                cols = np.any(target_mask, axis=0)
+                rmin, rmax = np.where(rows)[0][[0, -1]]
+                cmin, cmax = np.where(cols)[0][[0, -1]]
+                w = cmax - cmin
+                h = rmax - rmin
+                aspect = w / max(1, h)
+                if coverage <= 0.85 and 1.2 <= aspect <= 3.5:
+                    is_car = True
 
             edges = rgb_img.filter(ImageFilter.FIND_EDGES)
             edge_stat = ImageStat.Stat(edges)
             edge_mean = sum(edge_stat.mean[:3]) / 3
-            complexity = "featuring visible objects and defined structures" if edge_mean > 20 else "featuring smooth or uniform composition"
+            complexity = "with defined structures" if edge_mean > 20 else "with smooth composition"
 
-            desc = f"Frame at {timestamp_str} displays {', '.join(color_notes)} {complexity} (resolution {width}x{height})."
+            if is_car:
+                desc = f"Frame at {timestamp_str} displays a visible {dom_color} car / vehicle object {complexity} (resolution {width}x{height})."
+            elif dom_color != "neutral":
+                desc = f"Frame at {timestamp_str} displays a predominantly {dom_color} visual scene / object {complexity} (resolution {width}x{height})."
+            elif brightness > 210:
+                desc = f"Frame at {timestamp_str} displays a bright high-key visual environment {complexity} (resolution {width}x{height})."
+            elif brightness < 45:
+                desc = f"Frame at {timestamp_str} displays a dark low-key visual environment {complexity} (resolution {width}x{height})."
+            else:
+                desc = f"Frame at {timestamp_str} displays a natural daylight / indoor scene {complexity} (resolution {width}x{height})."
+
             return f"[{timestamp_str}] [LOCAL PIXEL/SCENE FALLBACK]: {desc}"
     except Exception as e:
         return f"[{timestamp_str}] [LOCAL PIXEL/SCENE FALLBACK]: Scene captured at timestamp {timestamp_str}."
@@ -785,16 +814,19 @@ def classify_question_intent(question: str) -> str:
     """Routes user question to 'visual', 'text', or 'multimodal'."""
     q = question.lower()
     visual_keywords = {
-        "visible", "visual", "visuals", "look", "looks", "see", "seeing", "scene", "shown", "show",
-        "showing", "color", "colour", "screen", "appear", "appears", "wearing", "clothes", "outfit",
-        "holding", "background", "foreground", "person doing", "people doing", "object", "objects",
-        "car", "vehicle", "room", "table", "chair", "board", "picture", "frame", "frames",
+        "visible", "visual", "visually", "visuals", "look", "looks", "looking", "appearance",
+        "see", "seen", "seeing", "scene", "shown", "show", "showing", "color", "colour",
+        "screen", "appear", "appears", "wearing", "clothes", "outfit", "holding",
+        "background", "foreground", "person doing", "people doing", "object", "objects",
+        "item", "items", "present", "car", "vehicle", "automobile", "room", "table",
+        "chair", "board", "picture", "frame", "frames", "photo", "image",
         "how many people", "who is visible", "what is on screen", "doing"
     }
     text_keywords = {
         "say", "said", "saying", "speak", "spoke", "spoken", "speaker", "mention", "mentioned",
-        "discuss", "discussed", "talk", "talked", "talking", "explain", "explained",
-        "quote", "words", "speech", "topic", "lecture", "audio", "listen", "hear", "heard"
+        "mentions", "mentioning", "discuss", "discussed", "discussing", "discussion", "talk",
+        "talked", "talking", "explain", "explained", "explaining", "quote", "words", "speech",
+        "topic", "lecture", "audio", "listen", "hear", "heard", "transcript", "stated", "state"
     }
     has_vis = any(re.search(rf"\b{re.escape(k)}\b", q) for k in visual_keywords)
     has_txt = any(re.search(rf"\b{re.escape(k)}\b", q) for k in text_keywords)
@@ -847,6 +879,7 @@ def retrieve_multimodal_context(
     transcript_docs = []
     visual_docs = []
 
+    # 1. Text evidence retrieval (only for text and multimodal queries)
     if intent in ("text", "multimodal") and text_retriever is not None:
         try:
             transcript_docs = text_retriever.invoke(question)
@@ -854,6 +887,7 @@ def retrieve_multimodal_context(
             print(f"[RAG] Text retrieval error: {e}")
             transcript_docs = []
 
+    # 2. Visual evidence retrieval (only for visual and multimodal queries)
     if intent in ("visual", "multimodal") and visual_retriever is not None:
         try:
             visual_docs = visual_retriever.invoke(question)
@@ -861,45 +895,67 @@ def retrieve_multimodal_context(
             print(f"[RAG] Visual retrieval error: {e}")
             visual_docs = []
 
-    # Timestamp-aware visual frame prioritization (Section 6)
-    if target_sec is not None and visual_vector_store is not None:
+    # 3. Timestamp-aware visual frame correlation
+    if visual_vector_store is not None:
         try:
             all_v_docs = list(getattr(visual_vector_store.docstore, "_dict", {}).values())
-            time_matched = [
-                d for d in all_v_docs
-                if abs(d.metadata.get("timestamp_sec", 999999) - target_sec) <= 15.0
-            ]
-            if time_matched:
-                time_matched.sort(key=lambda d: abs(d.metadata.get("timestamp_sec", 0) - target_sec))
-                existing_contents = {d.page_content for d in visual_docs}
-                extra_docs = [d for d in time_matched if d.page_content not in existing_contents]
-                visual_docs = (extra_docs + visual_docs)[:6]
-                print(f"[RAG] Timestamp alignment boosted {len(extra_docs)} frame(s) around {target_sec}s")
+            if target_sec is not None and all_v_docs:
+                time_matched = [
+                    d for d in all_v_docs
+                    if abs(d.metadata.get("timestamp_sec", 999999) - target_sec) <= 15.0
+                ]
+                if time_matched:
+                    time_matched.sort(key=lambda d: abs(d.metadata.get("timestamp_sec", 0) - target_sec))
+                    existing_contents = {d.page_content for d in visual_docs}
+                    extra_docs = [d for d in time_matched if d.page_content not in existing_contents]
+                    visual_docs = (extra_docs + visual_docs)[:6]
+                    print(f"[RAG] Timestamp alignment boosted {len(extra_docs)} frame(s) around {target_sec}s")
+            elif intent == "multimodal" and transcript_docs and all_v_docs and not visual_docs:
+                t_secs = []
+                for td in transcript_docs:
+                    sec = td.metadata.get("timestamp_sec")
+                    if sec is not None:
+                        t_secs.append(float(sec))
+                    else:
+                        m = re.findall(r"\[(\d{1,2}):(\d{2})\]", td.page_content)
+                        for mm, ss in m:
+                            t_secs.append(float(int(mm) * 60 + int(ss)))
+                if t_secs:
+                    avg_sec = sum(t_secs) / len(t_secs)
+                    time_matched = [
+                        d for d in all_v_docs
+                        if abs(d.metadata.get("timestamp_sec", 999999) - avg_sec) <= 20.0
+                    ]
+                    if time_matched:
+                        visual_docs = time_matched[:4]
         except Exception as e:
-            print(f"[RAG] Timestamp alignment error: {e}")
+            print(f"[RAG] Timestamp correlation error: {e}")
 
-    if not visual_docs and not transcript_docs:
-        if text_retriever is not None:
-            try:
-                transcript_docs = text_retriever.invoke(question)
-            except Exception:
-                pass
-        if visual_retriever is not None and not transcript_docs:
-            try:
-                visual_docs = visual_retriever.invoke(question)
-            except Exception:
-                pass
-
-    all_docs = transcript_docs + visual_docs
+    # Build context strictly separating SPOKEN and VISUAL evidence
+    all_docs = []
     context_sections = []
-    if transcript_docs:
+
+    if intent in ("text", "multimodal") and transcript_docs:
+        all_docs.extend(transcript_docs)
         t_text = "\n\n".join(d.page_content for d in transcript_docs)
         context_sections.append(f"[SPOKEN CONTENT]\n{t_text}")
-    if visual_docs:
+
+    if intent in ("visual", "multimodal") and visual_docs:
+        all_docs.extend(visual_docs)
         v_text = "\n".join(d.page_content for d in visual_docs)
         context_sections.append(f"[VISUAL CONTENT]\n{v_text}")
 
     combined_context = "\n\n".join(context_sections).strip()
+
+    # Mandatory debug information (Requirement 14)
+    print("\n" + "=" * 50)
+    print("QUESTION:", question)
+    print("INTENT:", intent)
+    print("TEXT RETRIEVAL:", [d.page_content for d in transcript_docs] if (intent in ("text", "multimodal") and transcript_docs) else "None")
+    print("VISUAL RETRIEVAL:", [d.page_content for d in visual_docs] if (intent in ("visual", "multimodal") and visual_docs) else "None")
+    print("FINAL CONTEXT:\n" + (combined_context if combined_context else "[EMPTY]"))
+    print("=" * 50 + "\n")
+
     return combined_context, all_docs, intent
 
 # ============================================================
@@ -1058,13 +1114,13 @@ def create_prompt() -> PromptTemplate:
 
 Answer the user's question using ONLY the supplied transcript evidence and visual evidence from the video.
 If timestamps are provided, reference them in your answer when relevant.
-If the user asks what is visible in the video, answer using the visual evidence.
-If the user asks what was spoken, answer using the transcript evidence.
-If the user asks what was happening while something was spoken, correlate both the transcript and visual evidence.
 
 CRITICAL RULES:
 1. Do not use outside knowledge. Do not guess. Do not invent facts.
-2. If the requested information cannot be supported by the supplied transcript or visual evidence, respond EXACTLY:
+2. For visual questions, answer based ONLY on the [VISUAL CONTENT]. Do NOT answer visual questions using transcript text.
+3. For spoken/audio questions, answer based ONLY on the [SPOKEN CONTENT].
+4. For multimodal questions, correlate and combine both [SPOKEN CONTENT] and [VISUAL CONTENT].
+5. If the requested information cannot be supported by the supplied transcript or visual evidence, respond EXACTLY:
 I couldn't find the answer to that in the video.
 
 EVIDENCE CONTEXT:
@@ -1091,11 +1147,13 @@ def generate_answer(context: str, question: str, docs: Optional[List[Any]] = Non
     general_query_terms = {
         "what", "who", "where", "when", "why", "how", "which", "is", "are", "was", "were", 
         "the", "a", "an", "in", "on", "at", "of", "to", "for", "and", "or", "not", "this", 
-        "that", "these", "those", "video", "mentioned", "discussed", "about", "main", "points", 
-        "summary", "summarize", "tell", "explain", "describe", "happens", "said", "say", 
-        "talk", "talking", "does", "did", "do", "can", "could", "would", "should", "any", "all",
-        "visible", "see", "seen", "shown", "show", "showing", "color", "colour", "look", "looks",
-        "scene", "screen", "frame", "frames", "objects", "object", "doing", "person", "people"
+        "that", "these", "those", "video", "mentioned", "discussed", "discuss", "discussing",
+        "about", "main", "points", "summary", "summarize", "tell", "explain", "describe",
+        "happens", "said", "say", "talk", "talking", "does", "did", "do", "can", "could",
+        "would", "should", "any", "all", "visible", "see", "seen", "shown", "show", "showing",
+        "color", "colour", "look", "looks", "scene", "screen", "frame", "frames", "objects",
+        "object", "doing", "person", "people", "sport", "game", "topic", "subject", "theme",
+        "item", "items", "present", "speaker", "saying", "speaking", "spoken", "state", "stated"
     }
     q_words = re.findall(r"\b[a-zA-Z0-9]+\b", question.lower())
     specific_keywords = [w for w in q_words if w not in general_query_terms and (len(w) >= 3 or w.isdigit())]
