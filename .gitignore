@@ -1,0 +1,22 @@
+# Environment Variables & Keys
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# Temporary files
+temp_audio/
+*.mp3
+*.wav
+*.mp4
+.DS_Store
