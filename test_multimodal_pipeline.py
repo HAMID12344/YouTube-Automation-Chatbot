@@ -87,17 +87,19 @@ def run_tests():
         frames_a = extract_video_frames(video_a_path, interval_seconds=2)
         assert len(frames_a) > 0, "No frames extracted from Video A."
         print(f"  -> Extracted {len(frames_a)} frame(s).")
-        for fpath, sec, ts in frames_a:
-            print(f"     Frame at {ts} -> {os.path.basename(fpath)}")
+        for fpath, sec, ts, idx in frames_a:
+            print(f"     Frame #{idx} at {ts} -> {os.path.basename(fpath)}")
 
         # Step 3: Visual analysis of frames
         print("[SETUP] Running visual analysis on Video A frames...")
         visual_records_a = []
-        for fpath, sec, ts in frames_a:
+        for fpath, sec, ts, idx in frames_a:
             desc = analyze_frame_visual(fpath, ts)
             visual_records_a.append({
                 "timestamp": ts,
                 "timestamp_sec": sec,
+                "frame_index": idx,
+                "source_video_id": "video_a",
                 "description": desc,
                 "frame_path": fpath
             })
@@ -189,11 +191,13 @@ def run_tests():
         create_synthetic_video(video_b_path, color="blue", label="BLUE BICYCLE", duration_sec=4)
         frames_b = extract_video_frames(video_b_path, interval_seconds=2)
         visual_records_b = []
-        for fpath, sec, ts in frames_b:
+        for fpath, sec, ts, idx in frames_b:
             desc = analyze_frame_visual(fpath, ts)
             visual_records_b.append({
                 "timestamp": ts,
                 "timestamp_sec": sec,
+                "frame_index": idx,
+                "source_video_id": "video_b",
                 "description": desc,
                 "frame_path": fpath
             })

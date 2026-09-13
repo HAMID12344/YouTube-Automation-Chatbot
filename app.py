@@ -368,10 +368,17 @@ class LocalExtractiveFallbackLLM:
         lower_q = (question or "").lower()
 
         # Multimodal handling: when context contains both transcript and visual sections
-        if "=== TRANSCRIPT EVIDENCE ===" in context and "=== VISUAL EVIDENCE" in context:
-            parts = context.split("=== VISUAL EVIDENCE")
-            t_part = parts[0].replace("=== TRANSCRIPT EVIDENCE ===", "").strip()
-            v_part = ("=== VISUAL EVIDENCE" + parts[1]).strip()
+        has_t = "[SPOKEN CONTENT]" in context or "=== TRANSCRIPT EVIDENCE ===" in context
+        has_v = "[VISUAL CONTENT]" in context or "=== VISUAL EVIDENCE" in context
+        if has_t and has_v:
+            if "[VISUAL CONTENT]" in context:
+                parts = context.split("[VISUAL CONTENT]")
+                t_part = parts[0].replace("[SPOKEN CONTENT]", "").strip()
+                v_part = parts[1].strip()
+            else:
+                parts = context.split("=== VISUAL EVIDENCE")
+                t_part = parts[0].replace("=== TRANSCRIPT EVIDENCE ===", "").strip()
+                v_part = ("=== VISUAL EVIDENCE" + parts[1]).strip()
 
             t_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", t_part) if len(s.strip()) > 15]
             v_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", v_part) if len(s.strip()) > 15]
@@ -617,7 +624,7 @@ def extract_video_frames(
     for idx, fpath in enumerate(frame_files):
         ts_sec = idx * interval_seconds
         ts_fmt = format_timestamp(ts_sec)
-        records.append((fpath, ts_sec, ts_fmt))
+        records.append((fpath, ts_sec, ts_fmt, idx))
 
     return records
 
@@ -658,7 +665,7 @@ def analyze_frame_visual(image_path: str, timestamp_str: str) -> str:
             vlm_text = res.choices[0].message.content.strip()
             if vlm_text:
                 print(f"[VISION] VLM ({VISION_MODEL_NAME}) at [{timestamp_str}]: {vlm_text[:70]}...")
-                return f"[{timestamp_str}] Visual Analysis: {vlm_text}"
+                return f"[{timestamp_str}] [REAL VLM DESCRIPTION - {VISION_MODEL_NAME}]: {vlm_text}"
         except Exception as vlm_err:
             safe_err = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(vlm_err))
             print(f"[VISION] Cloud VLM ({VISION_MODEL_NAME}) unavailable: {safe_err}. Using local visual analysis.")
@@ -695,9 +702,9 @@ def analyze_frame_visual(image_path: str, timestamp_str: str) -> str:
             complexity = "featuring visible objects and defined structures" if edge_mean > 20 else "featuring smooth or uniform composition"
 
             desc = f"Frame at {timestamp_str} displays {', '.join(color_notes)} {complexity} (resolution {width}x{height})."
-            return f"[{timestamp_str}] Visual Analysis: {desc}"
+            return f"[{timestamp_str}] [LOCAL PIXEL/SCENE FALLBACK]: {desc}"
     except Exception as e:
-        return f"[{timestamp_str}] Visual Analysis: Scene captured at timestamp {timestamp_str}."
+        return f"[{timestamp_str}] [LOCAL PIXEL/SCENE FALLBACK]: Scene captured at timestamp {timestamp_str}."
 
 
 def create_visual_vector_store(visual_records: List[Dict[str, Any]]):
@@ -705,9 +712,14 @@ def create_visual_vector_store(visual_records: List[Dict[str, Any]]):
     docs = [
         Document(
             page_content=rec["description"],
-            metadata={"timestamp": rec["timestamp"], "timestamp_sec": rec.get("timestamp_sec", 0)}
+            metadata={
+                "timestamp": rec["timestamp"],
+                "timestamp_sec": rec.get("timestamp_sec", 0),
+                "frame_index": rec.get("frame_index", idx),
+                "source_video_id": rec.get("source_video_id", "video"),
+            }
         )
-        for rec in visual_records if rec.get("description", "").strip()
+        for idx, rec in enumerate(visual_records) if rec.get("description", "").strip()
     ]
     if not docs:
         return None
@@ -792,10 +804,10 @@ def retrieve_multimodal_context(
     context_sections = []
     if transcript_docs:
         t_text = "\n\n".join(d.page_content for d in transcript_docs)
-        context_sections.append(f"=== TRANSCRIPT EVIDENCE ===\n{t_text}")
+        context_sections.append(f"[SPOKEN CONTENT]\n{t_text}")
     if visual_docs:
         v_text = "\n".join(d.page_content for d in visual_docs)
-        context_sections.append(f"=== VISUAL EVIDENCE (FRAME & SCENE ANALYSIS) ===\n{v_text}")
+        context_sections.append(f"[VISUAL CONTENT]\n{v_text}")
 
     combined_context = "\n\n".join(context_sections).strip()
     return combined_context, all_docs, intent
@@ -1421,11 +1433,13 @@ with tab_upload:
                             st.write("👁️ Analyzing video frames...")
                             frame_tuples = extract_video_frames(input_path, interval_seconds=FRAME_INTERVAL_SECONDS)
                             visual_records = []
-                            for fpath, ts_sec, ts_fmt in frame_tuples:
+                            for fpath, ts_sec, ts_fmt, f_idx in frame_tuples:
                                 desc = analyze_frame_visual(fpath, ts_fmt)
                                 visual_records.append({
                                     "timestamp": ts_fmt,
                                     "timestamp_sec": ts_sec,
+                                    "frame_index": f_idx,
+                                    "source_video_id": file_hash,
                                     "description": desc,
                                     "frame_path": fpath
                                 })
@@ -1505,13 +1519,13 @@ if st.session_state.video_processed:
             </div>
             <div style="border-left: 1px solid rgba(255, 255, 255, 0.08); padding-left: 20px;">
                 <div style="font-size: 12px; font-weight: 700; color: #94A3B8; letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 10px;">
-                    🧠 RAG Architecture & Metrics
+                    🧠 VIDEO UNDERSTANDING
                 </div>
                 <div style="color: #94A3B8; font-size: 14px; margin-bottom: 6px;">
-                    <b>Vector Store:</b> <span style="color:#4ADE80; font-weight:600;">FAISS • Active</span>
+                    <b>Modes:</b> <span class="tag-pill">🎙️ Spoken</span> <span class="tag-pill">👁️ Visual</span> <span class="tag-pill">🧠 Multimodal</span>
                 </div>
                 <div style="color: #94A3B8; font-size: 14px; margin-bottom: 6px;">
-                    <b>Embedding:</b> <span style="color:#A5B4FC;">MiniLM • 384 dimensions</span>
+                    <b>Vector Stores:</b> <span style="color:#4ADE80; font-weight:600;">Transcript FAISS</span> • <span style="color:#60A5FA; font-weight:600;">Visual FAISS</span>
                 </div>
                 <div style="color: #94A3B8; font-size: 14px; margin-bottom: 6px;">
                     <b>Transcript Chunks:</b> {st.session_state.chunk_count}

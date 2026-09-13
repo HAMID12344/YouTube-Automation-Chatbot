@@ -15,30 +15,46 @@ An intelligent Multimodal Video Question-Answering Chatbot built with Streamlit,
 ## System Architecture
 
 ```
-                    VIDEO
-                      |
-             +--------+--------+
-             |                 |
-             ↓                 ↓
-           AUDIO          VIDEO FRAMES
-             ↓                 ↓
-          WHISPER          VISION MODEL
-             ↓                 ↓
-        TRANSCRIPT       VISUAL ANALYSIS
-             ↓                 ↓
-        TEXT RAG          VISUAL RAG
-             |                 |
-             +--------+--------+
-                      ↓
-             MULTIMODAL RETRIEVAL
-                      ↓
-            TRANSCRIPT EVIDENCE
-                    +
-              VISUAL EVIDENCE
-                      ↓
-                     LLM
-                      ↓
-                   ANSWER
+USER
+ |
+ | YouTube URL / Local Video
+ v
+VIDEO INGESTION
+ |
+ +------------------------+
+ |                        |
+ v                        v
+AUDIO EXTRACTION       FRAME EXTRACTION
+ |                        |
+ v                        v
+WHISPER              QWEN2.5-VL
+ |                        |
+ v                        v
+TRANSCRIPT             VISUAL
+CHUNKS               DESCRIPTIONS
+ |                        |
+ v                        v
+TEXT EMBEDDINGS       VISUAL EMBEDDINGS
+ |                        |
+ v                        v
+TEXT FAISS            VISUAL FAISS
+ |                        |
+ +-----------+------------+
+             |
+             v
+      QUESTION ROUTER
+             |
+       +-----+-----+
+       |     |     |
+      TEXT VISUAL MULTIMODAL
+       |     |     |
+       +-----+-----+
+             |
+             v
+       GROUNDED LLM
+             |
+             v
+      FINAL ANSWER
 ```
 
 ### Retrieval & Question Routing
