@@ -1,4 +1,5 @@
 import hashlib
+import html
 import os
 import re
 import shutil
@@ -65,6 +66,12 @@ LOCAL_MODEL_PATH = get_secret(
     "LOCAL_MODEL_PATH",
     r"c:\Users\ahmad\3D Objects\my local ai chat bot\models\qwen2.5-0.5b-instruct-q4_k_m.gguf"
 )
+
+def render_html(html_str: str) -> None:
+    """Render HTML safely without Markdown treating indented lines as code blocks."""
+    clean_lines = [line.strip() for line in html_str.splitlines() if line.strip()]
+    st.markdown("\n".join(clean_lines), unsafe_allow_html=True)
+
 
 st.set_page_config(
     page_title="YouTube & Video RAG AI",
@@ -632,14 +639,13 @@ def run_unified_rag_pipeline(
 # ============================================================
 
 with st.sidebar:
-    st.markdown(
+    render_html(
         """
         <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 20px;">
             <span style="font-size: 22px;">⚙️</span>
             <span style="font-size: 20px; font-weight: 700; color: #F3F4F6;">System</span>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
     st.markdown(
@@ -699,7 +705,7 @@ with st.sidebar:
 # PREMIUM HEADER
 # ============================================================
 
-st.markdown(
+render_html(
     """
     <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 15px; margin-bottom: 24px;">
         <div>
@@ -715,8 +721,7 @@ st.markdown(
             <span>● AI System Online</span>
         </div>
     </div>
-    """,
-    unsafe_allow_html=True,
+    """
 )
 
 if not HF_TOKEN:
@@ -795,8 +800,7 @@ with tab_yt:
                         st.write("05 FAISS Indexing")
                         run_unified_rag_pipeline(transcript, source_used, "YouTube", meta, vid_id)
 
-                        status.update(label="✓ Video successfully processed", state="complete")
-                    st.success("✓ Video successfully processed")
+                        status.update(label="✓ Video successfully processed", state="complete", expanded=False)
             except Exception as e:
                 safe_msg = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(e))
                 st.error(f"❌ Unable to process video: {safe_msg}")
@@ -857,8 +861,7 @@ with tab_upload:
                         st.write("05 FAISS Indexing")
                         run_unified_rag_pipeline(transcript, source_used, "Uploaded Video", meta, file_hash)
 
-                        status.update(label="✓ Video successfully processed", state="complete")
-                    st.success("✓ Video successfully processed")
+                        status.update(label="✓ Video successfully processed", state="complete", expanded=False)
             except Exception as e:
                 safe_msg = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(e))
                 st.error(f"❌ Unable to process video: {safe_msg}")
@@ -868,57 +871,68 @@ with tab_upload:
 # ============================================================
 
 if st.session_state.video_processed:
-    meta = st.session_state.video_metadata
-    st.markdown(
-        f"""
-        <div class="glass-card" style="margin-top: 20px;">
-            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px;">
-                <div>
-                    <div style="font-size: 12px; font-weight: 700; color: #94A3B8; letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 10px;">
-                        📹 Video Information
-                    </div>
-                    <div style="font-size: 17px; font-weight: 700; color: #F8FAFC; margin-bottom: 6px;">
-                        {meta.get('title', 'Video')}
-                    </div>
-                    <div style="color: #94A3B8; font-size: 14px; margin-bottom: 4px;">
-                        <b>Source:</b> <span class="tag-pill">{st.session_state.source_type}</span>
-                    </div>
-                    {f"<div style='color: #94A3B8; font-size: 14px; margin-bottom: 4px;'><b>Channel / Author:</b> {meta.get('uploader', 'N/A')}</div>" if st.session_state.source_type == 'YouTube' else ""}
-                    {f"<div style='color: #94A3B8; font-size: 14px; margin-bottom: 4px;'><b>File Name:</b> {meta.get('filename', 'N/A')} ({meta.get('size_mb', 'N/A')} MB)</div>" if st.session_state.source_type != 'YouTube' else ""}
-                    {f"<div style='color: #94A3B8; font-size: 14px; margin-bottom: 4px;'><b>YouTube URL:</b> <a href='{meta.get('url', '#')}' target='_blank' style='color:#818CF8;'>Link</a></div>" if st.session_state.source_type == 'YouTube' else ""}
-                    <div style="color: #94A3B8; font-size: 14px;">
-                        <b>Duration:</b> {meta.get('duration', 'N/A')} seconds
-                    </div>
+    meta = st.session_state.video_metadata or {}
+    raw_title = str(meta.get("title", "Video"))
+    title_escaped = html.escape(raw_title)
+    source_type = st.session_state.source_type
+
+    info_items = [
+        f"<div style='color: #94A3B8; font-size: 14px; margin-bottom: 4px;'><b>Source:</b> <span class='tag-pill'>{html.escape(source_type)}</span></div>"
+    ]
+    if source_type == "YouTube":
+        uploader = html.escape(str(meta.get("uploader", "N/A")))
+        yt_url = html.escape(str(meta.get("url", "#")))
+        info_items.append(f"<div style='color: #94A3B8; font-size: 14px; margin-bottom: 4px;'><b>Channel / Author:</b> {uploader}</div>")
+        info_items.append(f"<div style='color: #94A3B8; font-size: 14px; margin-bottom: 4px;'><b>YouTube URL:</b> <a href='{yt_url}' target='_blank' style='color:#818CF8;'>Link</a></div>")
+    else:
+        filename = html.escape(str(meta.get("filename", "N/A")))
+        size_mb = meta.get("size_mb", "N/A")
+        info_items.append(f"<div style='color: #94A3B8; font-size: 14px; margin-bottom: 4px;'><b>File Name:</b> {filename} ({size_mb} MB)</div>")
+
+    duration = meta.get("duration", "N/A")
+    info_items.append(f"<div style='color: #94A3B8; font-size: 14px;'><b>Duration:</b> {duration} seconds</div>")
+    info_html = "".join(info_items)
+
+    card_html = f"""
+    <div class="glass-card" style="margin-top: 20px;">
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px;">
+            <div>
+                <div style="font-size: 12px; font-weight: 700; color: #94A3B8; letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 10px;">
+                    📹 Video Information
                 </div>
-                <div style="border-left: 1px solid rgba(255, 255, 255, 0.08); padding-left: 20px;">
-                    <div style="font-size: 12px; font-weight: 700; color: #94A3B8; letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 10px;">
-                        🧠 RAG Architecture & Metrics
-                    </div>
-                    <div style="color: #94A3B8; font-size: 14px; margin-bottom: 6px;">
-                        <b>Vector Store:</b> <span style="color:#4ADE80; font-weight:600;">FAISS • Active</span>
-                    </div>
-                    <div style="color: #94A3B8; font-size: 14px; margin-bottom: 6px;">
-                        <b>Embedding:</b> <span style="color:#A5B4FC;">MiniLM • 384 dimensions</span>
-                    </div>
-                    <div style="color: #94A3B8; font-size: 14px; margin-bottom: 6px;">
-                        <b>Number of Chunks:</b> {st.session_state.chunk_count}
-                    </div>
-                    <div style="color: #94A3B8; font-size: 14px;">
-                        <b>Transcript Characters:</b> {len(st.session_state.transcript_text):,}
-                    </div>
+                <div style="font-size: 17px; font-weight: 700; color: #F8FAFC; margin-bottom: 8px;">
+                    {title_escaped}
+                </div>
+                {info_html}
+            </div>
+            <div style="border-left: 1px solid rgba(255, 255, 255, 0.08); padding-left: 20px;">
+                <div style="font-size: 12px; font-weight: 700; color: #94A3B8; letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 10px;">
+                    🧠 RAG Architecture & Metrics
+                </div>
+                <div style="color: #94A3B8; font-size: 14px; margin-bottom: 6px;">
+                    <b>Vector Store:</b> <span style="color:#4ADE80; font-weight:600;">FAISS • Active</span>
+                </div>
+                <div style="color: #94A3B8; font-size: 14px; margin-bottom: 6px;">
+                    <b>Embedding:</b> <span style="color:#A5B4FC;">MiniLM • 384 dimensions</span>
+                </div>
+                <div style="color: #94A3B8; font-size: 14px; margin-bottom: 6px;">
+                    <b>Number of Chunks:</b> {st.session_state.chunk_count}
+                </div>
+                <div style="color: #94A3B8; font-size: 14px;">
+                    <b>Transcript Characters:</b> {len(st.session_state.transcript_text):,}
                 </div>
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    </div>
+    """
+    render_html(card_html)
 
 # ============================================================
 # WELCOME STATE (BEFORE VIDEO IS PROCESSED)
 # ============================================================
 
 if not st.session_state.video_processed:
-    st.markdown(
+    render_html(
         """
         <div class="glass-card" style="text-align: center; padding: 36px 24px; margin-top: 25px;">
             <h2 style="margin: 0 0 10px 0; color: #F8FAFC; font-size: 24px; font-weight: 700;">
@@ -945,8 +959,7 @@ if not st.session_state.video_processed:
                 </div>
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 # ============================================================
