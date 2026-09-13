@@ -62,6 +62,10 @@ HF_TOKEN = (
     or get_secret("HUGGINGFACEHUB_ACCESS_TOKEN")
     or get_secret("HUGGINGFACE_API_TOKEN")
 )
+HF_INFERENCE_TOKEN = (
+    get_secret("HF_INFERENCE_TOKEN")
+    or HF_TOKEN
+)
 HF_MODEL_ID = get_secret("HF_MODEL_ID", "Qwen/Qwen2.5-Coder-32B-Instruct")
 HF_LOCAL_MODEL_ID = get_secret("HF_LOCAL_MODEL_ID", "sshleifer/tiny-gpt2")
 WHISPER_MODEL = get_secret("WHISPER_MODEL", "openai/whisper-large-v3")
@@ -643,41 +647,66 @@ def extract_video_frames(
 def analyze_frame_visual(image_path: str, timestamp_str: str) -> str:
     """
     Analyzes an extracted video frame using the configured Vision-Language Model
-    (Qwen/Qwen2.5-VL-3B-Instruct) via Hugging Face InferenceClient, with a resilient
-    local visual scene analyzer fallback to guarantee 0 crashes.
+    (Qwen/Qwen2.5-VL-3B-Instruct or Qwen/Qwen2.5-VL-72B-Instruct) via Hugging Face InferenceClient,
+    with a resilient local visual scene analyzer fallback to guarantee 0 crashes.
     """
     # Strategy 1: Cloud Vision-Language Model (VLM)
     force_local_vision = FORCE_LOCAL_VISION or os.getenv("FORCE_LOCAL_VISION", "").strip().lower() in ("1", "true", "yes")
-    if HF_TOKEN and not force_local_vision:
+    token_to_use = HF_INFERENCE_TOKEN or HF_TOKEN
+    if token_to_use and not force_local_vision:
         try:
             with open(image_path, "rb") as f:
                 img_bytes = f.read()
             img_b64 = base64.b64encode(img_bytes).decode("utf-8")
             data_uri = f"data:image/jpeg;base64,{img_b64}"
-            client = InferenceClient(token=HF_TOKEN)
-            res = client.chat.completions.create(
-                model=VISION_MODEL_NAME,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": data_uri}},
-                        {
-                            "type": "text",
-                            "text": (
-                                "Provide a concise, factual description of what is visually shown in this video frame. "
-                                "Identify visible objects, colors, people, actions, and the environment. "
-                                "Do not guess or invent details not present in the frame."
-                            )
-                        }
-                    ]
-                }],
-                max_tokens=100,
-                temperature=0.1,
-            )
-            vlm_text = res.choices[0].message.content.strip()
+            client = InferenceClient(token=token_to_use)
+
+            # Candidate vision models (starting with configured model, followed by flagship Qwen2.5-VL)
+            candidate_vlms = [VISION_MODEL_NAME]
+            if "Qwen2.5-VL-72B-Instruct" not in VISION_MODEL_NAME:
+                candidate_vlms.append("Qwen/Qwen2.5-VL-72B-Instruct")
+
+            vlm_text = None
+            used_model = VISION_MODEL_NAME
+            last_vlm_err = None
+
+            for vlm_model in candidate_vlms:
+                try:
+                    res = client.chat.completions.create(
+                        model=vlm_model,
+                        messages=[{
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": data_uri}},
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Provide a concise, factual description of what is visually shown in this video frame. "
+                                        "Identify visible objects, colors, people, actions, and the environment. "
+                                        "Do not guess or invent details not present in the frame."
+                                    )
+                                }
+                            ]
+                        }],
+                        max_tokens=100,
+                        temperature=0.1,
+                    )
+                    content = res.choices[0].message.content.strip()
+                    if content:
+                        vlm_text = content
+                        used_model = vlm_model
+                        break
+                except Exception as cand_err:
+                    last_vlm_err = cand_err
+                    if "model_not_supported" in str(cand_err) and len(candidate_vlms) > 1:
+                        continue
+                    break
+
             if vlm_text:
-                print(f"[VISION] VLM ({VISION_MODEL_NAME}) at [{timestamp_str}]: {vlm_text[:70]}...")
-                return f"[{timestamp_str}] [REAL VLM DESCRIPTION - {VISION_MODEL_NAME}]: {vlm_text}"
+                print(f"[VISION] VLM ({used_model}) at [{timestamp_str}]: {vlm_text[:70]}...")
+                return f"[{timestamp_str}] [REAL VLM DESCRIPTION - {used_model}]: {vlm_text}"
+            if last_vlm_err:
+                raise last_vlm_err
         except Exception as vlm_err:
             safe_err = re.sub(r"hf_[A-Za-z0-9]+", "[REDACTED]", str(vlm_err))
             print(f"[VISION] Cloud VLM ({VISION_MODEL_NAME}) unavailable: {safe_err}. Using local visual analysis.")
