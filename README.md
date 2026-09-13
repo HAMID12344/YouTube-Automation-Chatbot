@@ -1,3 +1,14 @@
+---
+title: YouTube Automation Chatbot
+emoji: 🎥
+colorFrom: red
+colorTo: blue
+sdk: streamlit
+sdk_version: 1.38.0
+app_file: app.py
+pinned: false
+---
+
 # LocalMind AI — Video & YouTube Automation Chatbot (RAG)
 
 > **Chat with YouTube videos and local video files using Retrieval-Augmented Generation (RAG)!**

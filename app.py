@@ -58,7 +58,7 @@ HF_TOKEN = (
     or get_secret("HUGGINGFACEHUB_ACCESS_TOKEN")
     or get_secret("HUGGINGFACE_API_TOKEN")
 )
-HF_MODEL_ID = get_secret("HF_MODEL_ID", "meta-llama/Llama-3.1-8B-Instruct")
+HF_MODEL_ID = get_secret("HF_MODEL_ID", "Qwen/Qwen2.5-Coder-32B-Instruct")
 HF_LOCAL_MODEL_ID = get_secret("HF_LOCAL_MODEL_ID", "sshleifer/tiny-gpt2")
 WHISPER_MODEL = get_secret("WHISPER_MODEL", "openai/whisper-large-v3")
 YOUTUBE_HTTP_PROXY = get_secret("YOUTUBE_HTTP_PROXY")
@@ -276,8 +276,15 @@ class LocalGGUFLLM:
             raise FileNotFoundError(f"Local GGUF model not found at path: {model_path}")
         from llama_cpp import Llama
         self.model_path = model_path
-        # 4096 context window supports complete retrieved chunks and conversational context
-        self.llm = Llama(model_path=model_path, n_ctx=4096, verbose=False)
+        threads = max(1, (os.cpu_count() or 4) - 1)
+        # 4096 context window with multithreading for fast CPU inference
+        self.llm = Llama(
+            model_path=model_path,
+            n_ctx=4096,
+            n_threads=threads,
+            n_batch=512,
+            verbose=False,
+        )
 
     def invoke(self, prompt: str) -> str:
         few_shot_system = """You are a video question-answering assistant.
@@ -564,11 +571,8 @@ def create_vector_store(chunks: List[Any]):
     embeddings = get_embeddings()
     return FAISS.from_documents(chunks, embeddings)
 
-def create_retriever(vector_store, chunk_count: int = 8):
-    if chunk_count >= 5:
-        k = min(8, max(5, chunk_count))
-    else:
-        k = max(1, chunk_count)
+def create_retriever(vector_store, chunk_count: int = 4):
+    k = min(4, max(1, chunk_count))
     return vector_store.as_retriever(
         search_type="similarity",
         search_kwargs={"k": k},
