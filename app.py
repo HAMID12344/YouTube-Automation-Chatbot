@@ -35,7 +35,6 @@ from langchain_huggingface import (
     ChatHuggingFace,
     HuggingFaceEmbeddings,
     HuggingFaceEndpoint,
-    HuggingFacePipeline,
 )
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
